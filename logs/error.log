@@ -1,0 +1,6 @@
+{"error":"this.autoTrader.isRunning is not a function","level":"error","message":"Error stopping trading bot","service":"binance-trader","timestamp":"2026-03-09 01:00:10 UTC"}
+{"error":"callback is not a function","level":"error","message":"User data message parse error","service":"binance-trader","timestamp":"2026-03-09 04:09:46 UTC"}
+{"error":"callback is not a function","level":"error","message":"User data message parse error","service":"binance-trader","timestamp":"2026-03-09 04:09:46 UTC"}
+{"error":"callback is not a function","level":"error","message":"User data message parse error","service":"binance-trader","timestamp":"2026-03-09 04:09:46 UTC"}
+{"error":"callback is not a function","level":"error","message":"User data message parse error","service":"binance-trader","timestamp":"2026-03-09 04:09:46 UTC"}
+{"error":"callback is not a function","level":"error","message":"User data message parse error","service":"binance-trader","timestamp":"2026-03-09 04:31:33 UTC"}
