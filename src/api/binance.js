@@ -61,24 +61,24 @@ class BinanceFuturesAPI {
       });
 
       // Log API request
-      await this.db.logEvent({
-        event_type: 'api_request',
-        severity: 'INFO',
-        message: `${method} ${endpoint}`,
-        data: { params: { ...params, signature: '***' }, status: response.status },
-      });
+      // await this.db.logEvent({
+      //   event_type: 'api_request',
+      //   severity: 'INFO',
+      //   message: `${method} ${endpoint}`,
+      //   data: { params: { ...params, signature: '***' }, status: response.status },
+      // });
 
       return response.data;
     } catch (error) {
       const errorMessage = error.response?.data?.msg || error.message;
       logger.error('Binance API error', { endpoint, error: errorMessage });
 
-      await this.db.logEvent({
-        event_type: 'api_error',
-        severity: 'ERROR',
-        message: `${method} ${endpoint} failed`,
-        data: { params: { ...params, signature: '***' }, error: errorMessage },
-      });
+      // await this.db.logEvent({
+      //   event_type: 'api_error',
+      //   severity: 'ERROR',
+      //   message: `${method} ${endpoint} failed`,
+      //   data: { params: { ...params, signature: '***' }, error: errorMessage },
+      // });
 
       throw new Error(`Binance API Error: ${errorMessage}`);
     }
