@@ -39,10 +39,12 @@ class TradingBot {
       riskCalculator: this.riskCalculator,
       db: this.db,
       telegram: this.telegram,
+      redisClient: this.redis, // Add Redis client for multi-confirmation strategy
       paperTrading: this.paperTrading,
       tradingEnabled: this.tradingEnabled,
-      scanInterval: 60000, // 1 minute
-      symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'],
+      useMultiConfirmation: true, // Enable multi-confirmation strategy
+      scanInterval: 180000, // 3 minutes - sync with SymbolScanner
+      symbolScanner: this.symbolScanner, // Pass scanner reference
     });
   }
 
@@ -172,12 +174,11 @@ class TradingBot {
 
       await this.telegram.sendAlert('Bot Started', 'Binance Futures Trading Bot is now running!', 'INFO');
 
-      // Start symbol scanner (runs every 5 minutes)
-      this.symbolScanner.start(5);
-      logger.info('✅ Symbol scanner started (interval: 5 minutes)');
-
-      // Auto-trading needs to be started manually via startAutoTrader()
-      logger.info('Auto-trading ready (call startAutoTrader() to begin)');
+      // Auto-start auto-trader if enabled
+      if (this.tradingEnabled) {
+        logger.info('🤖 Starting Auto Trader with integrated scanning');
+        await this.startAutoTrader();
+      }
 
       return true;
     } catch (error) {
@@ -197,7 +198,7 @@ class TradingBot {
       this.symbolScanner.stop();
 
       // Stop auto trader if running
-      if (this.autoTrader.isRunning()) {
+      if (this.autoTrader.isRunning) {
         await this.autoTrader.stop();
       }
 

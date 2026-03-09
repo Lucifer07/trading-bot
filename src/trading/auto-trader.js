@@ -35,29 +35,33 @@ class AutoTrader {
     // Initialize with current balance
     this.updateTier(config.api.accountBalance || 60);
 
-    // Initialize signal aggregator with tier-specific config
+    // Initialize signal aggregator with tier-specific config + multi-confirmation support
     this.signalAggregator = new SignalAggregator({
       minConfidence: this.currentTier.minConfidence,
       minConfluence: this.currentTier.minRiskReward,
       maxPositions: this.currentTier.maxPositions,
-      requiredAgreement: 1.0, // Both strategies must agree
+      requiredAgreement: 0.67, // 2 out of 3 strategies must agree
+      useMultiConfirmation: config.useMultiConfirmation !== false, // Enabled by default
+      binanceAPI: config.api, // Pass API for derivatives data
+      redisClient: config.redisClient, // Pass Redis for caching
     });
 
     // Initialize news checker for safety
     this.newsChecker = new NewsChecker({
       enabled: config.newsCheckEnabled !== false, // Enabled by default
-      checkInterval: 15 * 60 * 1000, // 15 minutes
+      checkInterval: 1* 60 * 1000, // 15 minutes
+      redisClient: config.redisClient, // Pass Redis for caching
     });
 
     // State
+    // State
     this.isRunning = false;
     this.scanInterval = this.currentTier.scanInterval;
-    this.symbols = this.currentTier.symbols || ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+    this.symbols = []; // Will be populated by scanner
     this.openTrades = new Map();
     this.tradeCount = 0;
     this.lastScanTime = null;
-    this.lastSymbolScanTime = null;
-    this.symbolScanInterval = 15 * 60 * 1000; // 15 minutes
+    this.symbolScanner = config.symbolScanner; // Reference to scanner
 
     logger.info('🔥 SURVIVAL MODE Auto Trader initialized', {
       tier: this.currentTier.name,
@@ -130,7 +134,7 @@ class AutoTrader {
   }
 
   /**
-   * Start auto trading
+   * Start auto trading with integrated scanning
    */
   async start() {
     if (this.isRunning) {
@@ -139,13 +143,13 @@ class AutoTrader {
     }
 
     this.isRunning = true;
-    logger.info('🚀 Starting Auto Trader');
+    logger.info('🚀 Starting Auto Trader with integrated scanning');
 
     // Load existing open trades
     await this.loadOpenTrades();
 
-    // Start scanning loop
-    await this.scanLoop();
+    // Start the main loop
+    this.mainLoop();
 
     return true;
   }
@@ -166,20 +170,53 @@ class AutoTrader {
   }
 
   /**
-   * Main scanning loop
+   * Main loop - scan then analyze continuously
    */
-  async scanLoop() {
+  async mainLoop() {
     while (this.isRunning) {
       try {
+        logger.info('\n🔄 ========== Starting new cycle ==========');
+        
+        // 1. Scan symbols
+        logger.info('📡 Step 1: Scanning symbols...');
+        const scanResults = await this.symbolScanner.scanSymbols();
+        
+        if (!scanResults || scanResults.length === 0) {
+          logger.warn('No scan results, waiting 10s before retry...');
+          await this.sleep(10000);
+          continue;
+        }
+        
+        // 2. Update symbols from scan (top 10)
+        const top10 = scanResults.slice(0, 10);
+        this.symbols = top10.map(r => r.symbol);
+        logger.info(`✅ Symbols updated: ${this.symbols.join(', ')}`);
+        
+        // 3. Send Telegram notification for top 5 (only if we have open trades)
+        const openTrades = await this.db.getOpenTrades();
+        if (openTrades.length > 0) {
+          logger.info('📱 Step 2: Sending Telegram notification (have open trades)...');
+          await this.sendTopOpportunitiesNotification(top10.slice(0, 5)).catch(err => {
+            logger.error('Failed to send Telegram notification', { error: err.message });
+          });
+        } else {
+          logger.info('⏭️  Step 2: Skipping Telegram notification (no open trades)');
+        }
+        
+        // 4. Analyze symbols
+        logger.info('🔍 Step 3: Analyzing symbols...');
         await this.scan();
         await this.manageOpenTrades();
+        
+        logger.info('✅ Cycle complete\n');
+        
       } catch (error) {
-        logger.error('Scan error', { error: error.message });
+        logger.error('Main loop error', { error: error.message, stack: error.stack });
+        await this.sleep(10000); // Wait 10s on error
       }
-
-      // Wait before next scan
-      await this.sleep(this.scanInterval);
     }
+    
+    logger.info('Main loop stopped');
   }
 
   /**
@@ -187,46 +224,33 @@ class AutoTrader {
    */
   async scan() {
     try {
-      this.lastScanTime = Date.now();
-
-      // Check if should scan for new symbols (every 15 minutes)
-      const shouldScanSymbols = !this.lastSymbolScanTime ||
-        (Date.now() - this.lastSymbolScanTime) > this.symbolScanInterval;
-
-      if (shouldScanSymbols) {
-        logger.info('🔍 Scanning for top profit potential symbols...');
-        const topSymbols = await getTopSymbols(10);
-
-        if (topSymbols && topSymbols.length > 0) {
-          const oldSymbols = this.symbols;
-          this.symbols = topSymbols;
-
-          logger.info('📊 Symbols updated', {
-            oldSymbols: oldSymbols.join(', '),
-            newSymbols: this.symbols.join(', ')
-          });
-        }
-
-        this.lastSymbolScanTime = Date.now();
+      // Skip scan if no symbols available yet
+      if (this.symbols.length === 0) {
+        logger.debug('No symbols available yet, skipping scan');
+        return;
       }
+
+      this.lastScanTime = Date.now();
 
       logger.info('🔍 Scanning market', {
         symbols: this.symbols.length,
+        symbolList: this.symbols.join(', '),
         timestamp: new Date(this.lastScanTime).toISOString(),
       });
 
       // Get open positions from database
       const openTrades = await this.db.getOpenTrades();
 
-      // PARALLEL: Scan all symbols at once
-      const scanPromises = this.symbols.map(symbol => 
-        this.scanSymbol(symbol, openTrades).catch(error => {
+      // SEQUENTIAL SCAN with delay to avoid rate limits
+      for (const symbol of this.symbols) {
+        try {
+          await this.scanSymbol(symbol, openTrades);
+          // Small delay between symbols to avoid rate limits (200ms)
+          await this.sleep(200);
+        } catch (error) {
           logger.error('Symbol scan error', { symbol, error: error.message });
-          return null;
-        })
-      );
-
-      await Promise.all(scanPromises);
+        }
+      }
 
       logger.info('✅ Scan complete', {
         timestamp: new Date().toISOString(),
@@ -271,6 +295,8 @@ class AutoTrader {
         return;
       }
 
+      logger.debug(`Market data for ${symbol}: fromCache=${marketData.fromCache}, price=${marketData.currentPrice.toFixed(6)}, klines=${marketData.klines.length}`);
+
       // Generate signal
       const signal = await this.signalAggregator.analyzeSymbol(symbol, marketData, openTrades);
 
@@ -289,15 +315,42 @@ class AutoTrader {
   }
 
   /**
-   * Fetch market data from Binance
+   * Fetch market data from Redis (cached by SymbolScanner) or Binance
    */
   async fetchMarketData(symbol) {
       try {
-        // PARALLEL: Fetch all market data at once
-        const [klines, ticker, ticker24h] = await Promise.all([
+        // Try to get from Redis first (from SymbolScanner)
+        const cachedData = await this.getSymbolDataFromRedis(symbol);
+        
+        if (cachedData && cachedData.klines && cachedData.klines.length >= 50) {
+          logger.debug(`Using cached market data for ${symbol} (age: ${this.getCacheAge(cachedData.scannedAt)}s)`);
+          
+          // Fetch recent trades separately (not cached by scanner)
+          const trades = await this.api.getRecentTrades(symbol, 100).catch(() => null);
+          
+          return {
+            symbol,
+            klines: cachedData.klines,
+            trades: trades || [],
+            currentPrice: cachedData.price,
+            volume: cachedData.volume,
+            quoteVolume: cachedData.volume, // Same as volume for futures
+            high: parseFloat(cachedData.ticker?.highPrice || cachedData.price),
+            low: parseFloat(cachedData.ticker?.lowPrice || cachedData.price),
+            change: cachedData.priceChange,
+            fromCache: true,
+          };
+        }
+        
+        // Fallback: Fetch from Binance if not in cache
+        logger.debug(`Cache miss for ${symbol}, fetching from Binance`);
+        
+        // PARALLEL: Fetch all market data at once (including trades for CVD)
+        const [klines, ticker, ticker24h, trades] = await Promise.all([
           this.api.getKlines(symbol, '1h', 200),
           this.api.getTickerPrice(symbol),
-          this.api.get24hrTicker(symbol)
+          this.api.get24hrTicker(symbol),
+          this.api.getRecentTrades(symbol, 100).catch(() => null) // Graceful fallback
         ]);
 
         const currentPrice = parseFloat(ticker.price);
@@ -305,12 +358,14 @@ class AutoTrader {
         return {
           symbol,
           klines,
+          trades: trades || [], // Include trades for CVD calculation
           currentPrice,
           volume: parseFloat(ticker24h.volume),
           quoteVolume: parseFloat(ticker24h.quoteVolume),
           high: parseFloat(ticker24h.highPrice),
           low: parseFloat(ticker24h.lowPrice),
           change: parseFloat(ticker24h.priceChangePercent),
+          fromCache: false,
         };
 
       } catch (error) {
@@ -318,6 +373,29 @@ class AutoTrader {
         return null;
       }
     }
+
+  /**
+   * Get symbol data from Redis (cached by SymbolScanner)
+   */
+  async getSymbolDataFromRedis(symbol) {
+    try {
+      const { getRedis } = require('../storage/redis');
+      const redis = getRedis();
+      return await redis.hget('symbol_scan:symbols', symbol);
+    } catch (error) {
+      logger.debug('Failed to get symbol from Redis', { symbol, error: error.message });
+      return null;
+    }
+  }
+
+  /**
+   * Calculate cache age in seconds
+   */
+  getCacheAge(scannedAt) {
+    if (!scannedAt) return 999;
+    const age = (Date.now() - new Date(scannedAt).getTime()) / 1000;
+    return Math.floor(age);
+  }
 
   /**
    * Execute a trade
@@ -827,6 +905,103 @@ class AutoTrader {
   async sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
+
+  /**
+   * Update symbols from scan results and trigger immediate analysis
+   * Called by SymbolScanner after each scan completes
+   */
+  async updateSymbolsFromScan(scanResults) {
+    try {
+      if (!scanResults || scanResults.length === 0) {
+        logger.warn('No scan results to update symbols');
+        // Notify completion even if no results
+        if (this.scanCompleteCallback) {
+          this.scanCompleteCallback();
+        }
+        return;
+      }
+
+      // Get top 10 symbols
+      const top10 = scanResults.slice(0, 10);
+      const newSymbols = top10.map(r => r.symbol);
+
+      const oldSymbols = this.symbols;
+      this.symbols = newSymbols;
+
+      logger.info('📊 Symbols updated from scan results', {
+        oldSymbols: oldSymbols.length > 0 ? oldSymbols.join(', ') : 'none',
+        newSymbols: this.symbols.join(', '),
+        top5RSI: top10.slice(0, 5).map(r => `${r.symbol}:${r.rsi.toFixed(2)}`).join(', ')
+      });
+
+      // Send Telegram notification for top 5 (non-blocking)
+      this.sendTopOpportunitiesNotification(top10.slice(0, 5)).catch(err => {
+        logger.error('Failed to send Telegram notification', { error: err.message });
+      });
+
+      // Analyze symbols immediately (this is the actual work)
+      logger.info('🔍 Starting analysis of top 10 symbols...');
+      await this.scan();
+      await this.manageOpenTrades();
+      logger.info('✅ Analysis complete');
+
+      // Notify SymbolScanner that we're done
+      if (this.scanCompleteCallback) {
+        logger.debug('Notifying SymbolScanner that analysis is complete');
+        this.scanCompleteCallback();
+      }
+
+    } catch (error) {
+      logger.error('Failed to update symbols from scan', { error: error.message });
+      // Always notify completion even on error to avoid deadlock
+      if (this.scanCompleteCallback) {
+        this.scanCompleteCallback();
+      }
+    }
+  }
+
+  /**
+   * Send Telegram notification for top opportunities
+   */
+  async sendTopOpportunitiesNotification(topResults) {
+    try {
+      const telegram = this.config.telegram;
+      if (!telegram || !telegram.enabled) {
+        return;
+      }
+
+      let message = `🔍 *Symbol Scanner - Top Opportunities*\n\n`;
+
+      for (let i = 0; i < topResults.length; i++) {
+        const r = topResults[i];
+        const trendIcon = r.trend === 'UP' ? '🟢' : r.trend === 'DOWN' ? '🔴' : '⚪';
+
+        message += `*${i + 1}. ${r.symbol}*\n`;
+        message += `💰 Price: $${r.price.toFixed(r.price < 1 ? 6 : 2)}\n`;
+        message += `📈 Change: ${r.priceChange >= 0 ? '+' : ''}${r.priceChange.toFixed(2)}%\n`;
+        message += `🌊 Volatility: ${(r.volatility * 100).toFixed(2)}%\n`;
+        message += `📊 RSI: ${r.rsi.toFixed(2)}\n`;
+        message += `${trendIcon} Trend: ${r.trend}\n`;
+        message += `⭐ Score: ${r.profitPotential.toFixed(0)}/100\n\n`;
+      }
+
+      message += `_Scan completed at ${new Date().toLocaleTimeString()}_`;
+
+      await telegram.sendAlert('Symbol Scanner', message, 'INFO');
+      logger.info('Top opportunities sent to Telegram');
+
+    } catch (error) {
+      logger.error('Failed to send notification', { error: error.message });
+    }
+  }
+
+  /**
+   * Sleep utility
+   */
+  async sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
 }
 
 module.exports = AutoTrader;

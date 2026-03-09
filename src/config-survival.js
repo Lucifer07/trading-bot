@@ -18,7 +18,6 @@ const CAPITAL_TIERS = {
     scanInterval: 180000,     // 3 minutes
     targetMonthly: 50,        // 50% return
     status: 'CRITICAL',
-    symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'], // Major pairs only
   },
   
   GROWTH: {
@@ -32,7 +31,6 @@ const CAPITAL_TIERS = {
     scanInterval: 240000,     // 4 minutes
     targetMonthly: 33,        // 33% return
     status: 'WARNING',
-    symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'],
   },
   
   SCALING: {
@@ -46,7 +44,6 @@ const CAPITAL_TIERS = {
     scanInterval: 300000,     // 5 minutes
     targetMonthly: 20,        // 20% return
     status: 'HEALTHY',
-    symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'ADAUSDT'],
   },
   
   SUSTAINABLE: {
@@ -60,7 +57,6 @@ const CAPITAL_TIERS = {
     scanInterval: 300000,     // 5 minutes
     targetMonthly: 15,        // 15% return (covers costs + growth)
     status: 'THRIVING',
-    symbols: null,            // Use scanner top 10
   },
 };
 

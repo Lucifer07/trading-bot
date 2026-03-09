@@ -42,12 +42,17 @@ class EMACrossoverStrategy extends BaseStrategy {
    */
   async analyze(symbol, marketData) {
     try {
+      logger.info(`📊 [EMA Crossover] Starting analysis for ${symbol}`);
+      
       const { klines } = marketData;
 
       // Extract closing prices
       const closes = klines.map(k => parseFloat(k[4]));
 
+      logger.debug(`[EMA Crossover] ${symbol}: Using ${closes.length} candles for calculation`);
+
       if (closes.length < Math.max(this.emaFast, this.emaSlow, this.emaTrend)) {
+        logger.debug(`❌ [EMA Crossover] ${symbol}: Insufficient data (${closes.length} candles)`);
         return null;
       }
 
@@ -65,13 +70,25 @@ class EMACrossoverStrategy extends BaseStrategy {
       const currentPrice = closes[closes.length - 1];
       const prevPrice = prevCloses[prevCloses.length - 1];
 
+      logger.info(`📈 [EMA Crossover] ${symbol}: Price=${currentPrice.toFixed(6)}, EMA9=${emaFast.toFixed(6)}, EMA21=${emaSlow.toFixed(6)}, EMA50=${emaTrend.toFixed(6)}`);
+      logger.info(`📉 [EMA Crossover] ${symbol}: Previous - EMA9=${emaFastPrev.toFixed(6)}, EMA21=${emaSlowPrev.toFixed(6)}`);
+
       // Determine trend
       const isUpTrend = currentPrice > emaTrend;
       const isDownTrend = currentPrice < emaTrend;
 
+      logger.info(`🎯 [EMA Crossover] ${symbol}: Trend=${isUpTrend ? 'UP' : isDownTrend ? 'DOWN' : 'SIDEWAYS'}`);
+
       // Detect crossovers
       const bullishCross = emaFastPrev <= emaSlowPrev && emaFast > emaSlow;
       const bearishCross = emaFastPrev >= emaSlowPrev && emaFast < emaSlow;
+
+      logger.info(`🔍 [EMA Crossover] ${symbol}: Crossover check - Bullish=${bullishCross}, Bearish=${bearishCross}`);
+      
+      if (!bullishCross && !bearishCross) {
+        const alignment = emaFast > emaSlow ? 'EMA9 > EMA21 (already bullish)' : 'EMA9 < EMA21 (already bearish)';
+        logger.info(`❌ [EMA Crossover] ${symbol}: No fresh crossover detected. Current: ${alignment}`);
+      }
 
       // Calculate confidence based on EMA alignment
       let confidence = 0;
@@ -83,21 +100,27 @@ class EMACrossoverStrategy extends BaseStrategy {
         confidence = 0.8;
         side = 'LONG';
         signal = 'BUY';
+        logger.info(`✅ [EMA Crossover] ${symbol}: STRONG BULLISH signal (crossover + uptrend), confidence=80%`);
       } else if (bullishCross) {
         // Moderate bullish signal
         confidence = 0.6;
         side = 'LONG';
         signal = 'BUY';
+        logger.info(`✅ [EMA Crossover] ${symbol}: MODERATE BULLISH signal (crossover only), confidence=60%`);
       } else if (bearishCross && isDownTrend) {
         // Strong bearish signal
         confidence = 0.8;
         side = 'SHORT';
         signal = 'SELL';
+        logger.info(`✅ [EMA Crossover] ${symbol}: STRONG BEARISH signal (crossover + downtrend), confidence=80%`);
       } else if (bearishCross) {
         // Moderate bearish signal
         confidence = 0.6;
         side = 'SHORT';
         signal = 'SELL';
+        logger.info(`✅ [EMA Crossover] ${symbol}: MODERATE BEARISH signal (crossover only), confidence=60%`);
+      } else {
+        logger.info(`❌ [EMA Crossover] ${symbol}: No signal generated`);
       }
 
       // Generate indicators for confluence

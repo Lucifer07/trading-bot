@@ -1,16 +1,21 @@
 const logger = require('../utils/logger');
 const EMACrossoverStrategy = require('../strategies/ema-crossover');
 const RSIStrategy = require('../strategies/rsi-strategy');
+const MultiConfirmationStrategy = require('../strategies/multi-confirmation-strategy');
 
 class SignalAggregator {
   constructor(config = {}) {
     this.minConfidence = config.minConfidence || 0.75; // Lowered from 0.7 for survival mode
     this.minConfluence = config.minConfluence || 2.5;  // Lowered from 2 for survival mode
     this.maxPositions = config.maxPositions || 2;      // Reduced from 3 for survival mode
-    this.requiredAgreement = config.requiredAgreement || 1.0; // Increased from 0.6 - BOTH must agree
+    this.requiredAgreement = config.requiredAgreement || 0.67; // 2 out of 3 strategies must agree
 
-    // Initialize strategies
+    // Store config for multi-confirmation strategy
+    this.config = config;
+
+    // Initialize strategies - HYBRID APPROACH
     this.strategies = [
+      // Original strategies (proven and working)
       new EMACrossoverStrategy({
         enabled: true,
         riskPercent: 1.5,  // Increased from 0.8 for survival mode
@@ -21,10 +26,23 @@ class SignalAggregator {
         riskPercent: 1.5,  // Increased from 0.8 for survival mode
         maxPositions: 2,
       }),
+      // New advanced multi-confirmation strategy
+      new MultiConfirmationStrategy({
+        enabled: config.useMultiConfirmation !== false, // Enabled by default
+        riskPercent: 2.0,
+        maxPositions: 2,
+        requiredConfirmations: 4,
+        binanceAPI: config.binanceAPI,
+        redisClient: config.redisClient,
+        useMultiTimeframe: false, // Disabled for now
+        useOrderBookImbalance: false, // Disabled for now
+        useNewsIntegration: true,
+      }),
     ];
 
-    logger.info('🔥 SURVIVAL MODE Signal Aggregator initialized', {
+    logger.info('🔥 HYBRID STRATEGY Signal Aggregator initialized', {
       strategiesCount: this.strategies.length,
+      strategies: this.strategies.map(s => s.name),
       minConfidence: this.minConfidence,
       minConfluence: this.minConfluence,
       requiredAgreement: this.requiredAgreement,
@@ -37,23 +55,33 @@ class SignalAggregator {
    */
   async analyzeSymbol(symbol, marketData, openPositions) {
     try {
+      logger.info(`\n${'='.repeat(80)}`);
+      logger.info(`🎯 [Signal Aggregator] Analyzing ${symbol}`);
+      logger.info(`${'='.repeat(80)}`);
+      
       // Check if should trade this symbol
       const tradeCheck = await this.shouldTrade(symbol, openPositions);
       if (!tradeCheck.shouldTrade) {
-        logger.debug('Skipping symbol analysis', { symbol, reason: tradeCheck.reason });
+        logger.info(`⏭️  [Signal Aggregator] ${symbol}: Skipping - ${tradeCheck.reason}`);
         return null;
       }
+
+      logger.info(`✅ [Signal Aggregator] ${symbol}: Pre-checks passed, analyzing with ${this.strategies.length} strategies...`);
 
       // PARALLEL: Get signals from all strategies at once
       const signalPromises = this.strategies.map(strategy =>
         strategy.analyze(symbol, marketData)
-          .then(signal => (signal && signal.valid) ? signal : null)
+          .then(signal => {
+            if (signal && signal.valid) {
+              logger.info(`✅ [Signal Aggregator] ${symbol}: ${strategy.name} generated ${signal.side} signal (confidence: ${(signal.confidence * 100).toFixed(0)}%)`);
+              return signal;
+            } else {
+              logger.info(`❌ [Signal Aggregator] ${symbol}: ${strategy.name} - No valid signal`);
+              return null;
+            }
+          })
           .catch(error => {
-            logger.error('Strategy analysis error', {
-              strategy: strategy.name,
-              symbol,
-              error: error.message,
-            });
+            logger.error(`❌ [Signal Aggregator] ${symbol}: ${strategy.name} error - ${error.message}`);
             return null;
           })
       );
@@ -61,9 +89,14 @@ class SignalAggregator {
       const signalResults = await Promise.all(signalPromises);
       const signals = signalResults.filter(s => s !== null);
 
+      logger.info(`\n📊 [Signal Aggregator] ${symbol}: Strategy Results Summary:`);
+      logger.info(`   Total strategies: ${this.strategies.length}`);
+      logger.info(`   Signals generated: ${signals.length}`);
+      logger.info(`   Required agreement: ${(this.requiredAgreement * 100).toFixed(0)}% (${Math.ceil(this.strategies.length * this.requiredAgreement)}/${this.strategies.length})`);
+
       // If no signals, return null
       if (signals.length === 0) {
-        logger.debug('No valid signals', { symbol });
+        logger.info(`❌ [Signal Aggregator] ${symbol}: No valid signals from any strategy\n`);
         return null;
       }
 
@@ -92,6 +125,8 @@ class SignalAggregator {
    */
   async aggregateSignals(signals, symbol, marketData, openPositions) {
     try {
+      logger.info(`\n🔄 [Signal Aggregator] ${symbol}: Aggregating ${signals.length} signals...`);
+      
       // Count bullish and bearish signals
       const bullishSignals = signals.filter(s => s.side === 'LONG');
       const bearishSignals = signals.filter(s => s.side === 'SHORT');
@@ -100,9 +135,23 @@ class SignalAggregator {
       const bullishCount = bullishSignals.length;
       const bearishCount = bearishSignals.length;
 
+      logger.info(`   📊 Vote count: LONG=${bullishCount}, SHORT=${bearishCount}`);
+      
+      // List which strategies voted for what
+      if (bullishCount > 0) {
+        const bullishStrategies = bullishSignals.map(s => s.strategy).join(', ');
+        logger.info(`   📈 LONG votes from: ${bullishStrategies}`);
+      }
+      if (bearishCount > 0) {
+        const bearishStrategies = bearishSignals.map(s => s.strategy).join(', ');
+        logger.info(`   📉 SHORT votes from: ${bearishStrategies}`);
+      }
+
       // Check if there's enough agreement
       const bullishAgreement = bullishCount / totalSignals;
       const bearishAgreement = bearishCount / totalSignals;
+
+      logger.info(`   🎯 Agreement: LONG=${(bullishAgreement * 100).toFixed(0)}%, SHORT=${(bearishAgreement * 100).toFixed(0)}%`);
 
       let side = 'NEUTRAL';
       let agreement = 0;
@@ -110,19 +159,17 @@ class SignalAggregator {
       if (bullishAgreement >= this.requiredAgreement && bullishAgreement > bearishAgreement) {
         side = 'LONG';
         agreement = bullishAgreement;
+        logger.info(`   ✅ Direction: LONG (${(agreement * 100).toFixed(0)}% agreement)`);
       } else if (bearishAgreement >= this.requiredAgreement && bearishAgreement > bullishAgreement) {
         side = 'SHORT';
         agreement = bearishAgreement;
+        logger.info(`   ✅ Direction: SHORT (${(agreement * 100).toFixed(0)}% agreement)`);
       }
 
       // If no clear agreement, return null
       if (side === 'NEUTRAL') {
-        logger.debug('No clear agreement on direction', {
-          symbol,
-          bullishCount,
-          bearishCount,
-          totalSignals,
-        });
+        logger.info(`   ❌ No clear agreement (need ${(this.requiredAgreement * 100).toFixed(0)}%)`);
+        logger.info(`❌ [Signal Aggregator] ${symbol}: REJECTED - Insufficient agreement\n`);
         return null;
       }
 
@@ -130,9 +177,12 @@ class SignalAggregator {
       const signalsForSide = side === 'LONG' ? bullishSignals : bearishSignals;
       const avgConfidence = signalsForSide.reduce((sum, s) => sum + s.confidence, 0) / signalsForSide.length;
 
+      logger.info(`   📊 Average confidence: ${(avgConfidence * 100).toFixed(1)}% (min required: ${(this.minConfidence * 100).toFixed(0)}%)`);
+
       // Check minimum confidence
       if (avgConfidence < this.minConfidence) {
-        logger.debug('Confidence too low', { symbol, avgConfidence, minConfidence: this.minConfidence });
+        logger.info(`   ❌ Confidence too low: ${(avgConfidence * 100).toFixed(1)}% < ${(this.minConfidence * 100).toFixed(0)}%`);
+        logger.info(`❌ [Signal Aggregator] ${symbol}: REJECTED - Low confidence\n`);
         return null;
       }
 
@@ -157,13 +207,13 @@ class SignalAggregator {
       const rewardAmount = Math.abs(avgTakeProfit - avgEntryPrice);
       const riskRewardRatio = rewardAmount / riskAmount;
 
+      logger.info(`   💰 Risk/Reward: ${riskRewardRatio.toFixed(2)}:1 (min required: ${this.minConfluence}:1)`);
+      logger.info(`   📍 Entry: ${avgEntryPrice.toFixed(6)}, SL: ${bestStopLoss.toFixed(6)}, TP: ${avgTakeProfit.toFixed(6)}`);
+
       // Check minimum risk-reward ratio
       if (riskRewardRatio < this.minConfluence) {
-        logger.debug('Risk-reward ratio too low', {
-          symbol,
-          riskRewardRatio,
-          minRatio: this.minConfluence,
-        });
+        logger.info(`   ❌ Risk/Reward too low: ${riskRewardRatio.toFixed(2)} < ${this.minConfluence}`);
+        logger.info(`❌ [Signal Aggregator] ${symbol}: REJECTED - Poor risk/reward\n`);
         return null;
       }
 
@@ -210,6 +260,14 @@ class SignalAggregator {
         signalsCount: signalsForSide.length,
         strategies: signalsForSide.map(s => s.strategy),
       };
+
+      logger.info(`\n✅ [Signal Aggregator] ${symbol}: SIGNAL GENERATED!`);
+      logger.info(`   Direction: ${side}`);
+      logger.info(`   Confidence: ${(avgConfidence * 100).toFixed(1)}%`);
+      logger.info(`   Agreement: ${(agreement * 100).toFixed(0)}%`);
+      logger.info(`   R/R Ratio: ${riskRewardRatio.toFixed(2)}:1`);
+      logger.info(`   Strategies: ${signalsForSide.map(s => s.strategy).join(', ')}`);
+      logger.info(`${'='.repeat(80)}\n`);
 
       return result;
 

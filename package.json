@@ -13,8 +13,8 @@
     "test:scanner": "node test-scanner.js",
     "test:binance": "node test-binance-connection.js",
     "dev": "nodemon src/index.js",
-    "test": "jest",
-    "test:watch": "jest --watch",
+    "test": "mocha tests/**/*.test.js --timeout 10000",
+    "test:watch": "mocha tests/**/*.test.js --watch",
     "lint": "eslint src/**/*.js",
     "db:init": "node src/storage/init.js",
     "setup:cron": "./setup-crontab.sh",
@@ -47,5 +47,10 @@
     "uuid": "^10.0.0",
     "winston": "^3.17.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "chai": "^6.2.2",
+    "mocha": "^11.7.5",
+    "sinon": "^21.0.2"
   }
 }

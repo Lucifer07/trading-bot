@@ -11,6 +11,8 @@ class NewsChecker {
     this.checkInterval = config.checkInterval || 15 * 60 * 1000; // 15 minutes
     this.newsCache = new Map();
     this.lastCheckTime = null;
+    this.redis = config.redisClient || null; // Redis client for persistent caching
+    this.redisCacheTTL = 60; // 1 minute in seconds
     
     // News sources (CryptoPanic API v2)
     this.apiKey = process.env.CRYPTOPANIC_API_KEY || null;
@@ -42,6 +44,8 @@ class NewsChecker {
     logger.info('News Checker initialized', {
       enabled: this.enabled,
       checkInterval: this.checkInterval / 1000 + 's',
+      redisCacheTTL: this.redisCacheTTL + 's',
+      hasRedis: !!this.redis,
       hasCryptoPanicKey: !!this.apiKey,
       apiPlan: this.apiPlan,
     });
@@ -66,14 +70,8 @@ class NewsChecker {
       // Extract base asset (BTC from BTCUSDT)
       const baseAsset = symbol.replace('USDT', '').replace('BUSD', '');
       
-      // Check if we need to refresh news
-      const shouldRefresh = !this.lastCheckTime || 
-        (Date.now() - this.lastCheckTime) > this.checkInterval;
-      
-      if (shouldRefresh) {
-        await this.fetchLatestNews();
-        this.lastCheckTime = Date.now();
-      }
+      // Check Redis cache first, then fetch if needed
+      await this.ensureNewsLoaded();
       
       // Analyze news for this symbol
       const analysis = this.analyzeNewsForSymbol(baseAsset);
@@ -115,14 +113,50 @@ class NewsChecker {
   }
 
   /**
+   * Ensure news is loaded (from Redis cache or API)
+   */
+  async ensureNewsLoaded() {
+    const redisKey = 'news:cryptopanic:latest';
+    
+    try {
+      // Step 1: Check Redis cache first
+      if (this.redis) {
+        const cachedNews = await this.redis.get(redisKey);
+        
+        if (cachedNews) {
+          logger.debug('News loaded from Redis cache', { 
+            count: cachedNews.length,
+            source: 'redis'
+          });
+          
+          // Load into memory cache
+          this.cacheNews(cachedNews);
+          return;
+        }
+        
+        logger.debug('No news in Redis cache, fetching from API');
+      }
+      
+      // Step 2: If not in Redis, fetch from API
+      await this.fetchLatestNews();
+      
+    } catch (error) {
+      logger.error('Ensure news loaded error', { error: error.message });
+    }
+  }
+
+  /**
    * Fetch latest crypto news
    */
   async fetchLatestNews() {
+    const redisKey = 'news:cryptopanic:latest';
+    
     try {
       const news = [];
       
       // Try CryptoPanic API if key available
       if (this.apiKey) {
+        logger.info('Fetching news from CryptoPanic API...');
         const cryptoPanicNews = await this.fetchCryptoPanicNews();
         news.push(...cryptoPanicNews);
       }
@@ -131,15 +165,41 @@ class NewsChecker {
       if (news.length === 0) {
         logger.debug('No API key or no news fetched, using fallback');
         // For now, return empty - can add RSS parser later
+        return;
       }
       
-      // Cache news by symbol
+      // Cache news in memory
       this.cacheNews(news);
       
-      logger.debug('News fetched', { count: news.length });
+      // Cache news in Redis with 1 minute TTL
+      if (this.redis) {
+        await this.redis.set(redisKey, news, this.redisCacheTTL);
+        logger.info('News cached to Redis', { 
+          count: news.length,
+          ttl: this.redisCacheTTL + 's'
+        });
+      }
+      
+      logger.info('News fetched successfully', { 
+        count: news.length,
+        source: 'api'
+      });
       
     } catch (error) {
       logger.error('Fetch news error', { error: error.message });
+      
+      // Try to use Redis cache even if API fails
+      if (this.redis) {
+        try {
+          const cachedNews = await this.redis.get(redisKey);
+          if (cachedNews) {
+            logger.warn('Using Redis cache after API failure', { count: cachedNews.length });
+            this.cacheNews(cachedNews);
+          }
+        } catch (redisError) {
+          logger.error('Redis fallback failed', { error: redisError.message });
+        }
+      }
     }
   }
 

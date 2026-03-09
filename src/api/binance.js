@@ -118,6 +118,28 @@ class BinanceFuturesAPI {
     return await this.request('/fapi/v1/openInterest', 'GET', params, false);
   }
 
+  // Derivatives data endpoints
+  async getFundingRate(symbol) {
+    return await this.request('/fapi/v1/premiumIndex', 'GET', { symbol }, false);
+  }
+
+  async getOpenInterestStats(symbol) {
+    return await this.request('/fapi/v1/openInterest', 'GET', { symbol }, false);
+  }
+
+  async getOpenInterestHistory(symbol, period = '1h', limit = 30) {
+    return await this.request('/futures/data/openInterestHist', 'GET', { symbol, period, limit }, false);
+  }
+
+  async getLongShortRatio(symbol, period = '1h', limit = 30) {
+    return await this.request('/futures/data/globalLongShortAccountRatio', 'GET', { symbol, period, limit }, false);
+  }
+
+  async getRecentTrades(symbol, limit = 500) {
+    return await this.request('/fapi/v1/trades', 'GET', { symbol, limit }, false);
+  }
+
+
   // Private endpoints (require API key)
   async getAccount(recvWindow = 5000) {
     return await this.request('/fapi/v2/account', 'GET', { recvWindow }, true);

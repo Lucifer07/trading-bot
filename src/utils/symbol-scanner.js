@@ -7,7 +7,6 @@ class SymbolScanner {
     this.redis = redis;
     this.telegram = telegram;
     this.baseUrl = config.binance.baseUrl;
-    this.scanInterval = null;
     this.isScanning = false;
   }
 
@@ -33,7 +32,7 @@ class SymbolScanner {
     }
   }
 
-  async getKlines(symbol, interval = '1h', limit = 100) {
+  async getKlines(symbol, interval = '1h', limit = 200) {
     try {
       const response = await axios.get(`${this.baseUrl}/fapi/v1/klines`, {
         params: { symbol, interval, limit }
@@ -77,17 +76,24 @@ class SymbolScanner {
     let gains = 0;
     let losses = 0;
 
+    // Calculate initial average gain/loss
     for (let i = 1; i <= period; i++) {
       const change = closes[i] - closes[i - 1];
-      if (change > 0) gains += change;
-      else losses += Math.abs(change);
+      if (change > 0) {
+        gains += change;
+      } else {
+        losses += Math.abs(change);
+      }
     }
 
     const avgGain = gains / period;
     const avgLoss = losses / period;
 
+    // Calculate RSI using smoothed averages
     const rs = avgLoss === 0 ? Infinity : avgGain / avgLoss;
-    return 100 - (100 / (1 + rs));
+    const rsi = 100 - (100 / (1 + rs));
+    
+    return rsi;
   }
 
   calculateEMA(prices, period) {
@@ -197,13 +203,18 @@ class SymbolScanner {
               const ticker = await this.get24hrTicker(symbol);
               if (!ticker) return null;
 
-              const klines = await this.getKlines(symbol, '1h', 100);
+              const klines = await this.getKlines(symbol, '1h', 200);
               if (!klines || klines.length < 50) return null;
 
               const atr = this.calculateATR(klines, 14);
               const rsi = this.calculateRSI(klines, 14);
               const trend = this.calculateTrend(klines);
               const profitPotential = this.calculateProfitPotential(ticker, klines, atr);
+
+              // Log RSI calculation for debugging
+              if (symbol === 'ARIAUSDT' || symbol === 'DEGOUSDT' || symbol === 'BOBUSDT') {
+                logger.info(`[SymbolScanner] ${symbol}: RSI=${rsi.toFixed(2)} (from ${klines.length} candles), Price=${parseFloat(ticker.lastPrice).toFixed(6)}`);
+              }
 
               return {
                 symbol,
@@ -215,6 +226,10 @@ class SymbolScanner {
                 trend,
                 profitPotential,
                 atr,
+                // Store full data for strategies to use
+                klines,
+                trades: [], // Will be fetched by strategies if needed
+                ticker,
                 scannedAt: new Date().toISOString(),
               };
             } catch (error) {
@@ -242,13 +257,12 @@ class SymbolScanner {
           topScore: results[0]?.profitPotential || 0,
         });
 
-        // Save to Redis
+        // Save to Redis for backup/reference
         await this.saveToRedis(results);
 
-        // Send notification for top opportunities
-        await this.notifyTopOpportunities(results.slice(0, 10));
-
         this.isScanning = false;
+        
+        // Return results for immediate use by AutoTrader
         return results;
 
       } catch (error) {
@@ -260,10 +274,12 @@ class SymbolScanner {
 
   async saveToRedis(results) {
     try {
+      const timestamp = new Date().toISOString();
+      
       // Save all results
       await this.redis.set('symbol_scan:latest', {
         results,
-        scannedAt: new Date().toISOString(),
+        scannedAt: timestamp,
         count: results.length,
       }, 600); // TTL 10 minutes
 
@@ -279,7 +295,11 @@ class SymbolScanner {
       // Set expiry for hash
       await this.redis.expire('symbol_scan:symbols', 600);
 
-      logger.info('Scan results saved to Redis', { count: results.length });
+      logger.info('Scan results saved to Redis', { 
+        count: results.length,
+        timestamp,
+        top5RSI: results.slice(0, 5).map(r => `${r.symbol}:${r.rsi.toFixed(2)}`).join(', ')
+      });
     } catch (error) {
       logger.error('Failed to save scan results to Redis', { error: error.message });
     }
@@ -291,6 +311,12 @@ class SymbolScanner {
         return;
       }
 
+      // Log what we're about to send
+      logger.info('Preparing Telegram notification', {
+        count: topResults.length,
+        top5RSI: topResults.slice(0, 5).map(r => `${r.symbol}:${r.rsi.toFixed(2)}`).join(', ')
+      });
+
       let message = `🔍 *Symbol Scanner - Top Opportunities*\n\n`;
 
       for (let i = 0; i < Math.min(5, topResults.length); i++) {
@@ -301,7 +327,7 @@ class SymbolScanner {
         message += `💰 Price: $${r.price.toFixed(2)}\n`;
         message += `📈 Change: ${r.priceChange >= 0 ? '+' : ''}${r.priceChange.toFixed(2)}%\n`;
         message += `🌊 Volatility: ${(r.volatility * 100).toFixed(2)}%\n`;
-        message += `📊 RSI: ${r.rsi.toFixed(1)}\n`;
+        message += `📊 RSI: ${r.rsi.toFixed(2)}\n`;
         message += `${trendIcon} Trend: ${r.trend}\n`;
         message += `⭐ Score: ${r.profitPotential.toFixed(0)}/100\n\n`;
       }
@@ -343,42 +369,22 @@ class SymbolScanner {
     }
   }
 
-  start(intervalMinutes = 5) {
-    if (this.scanInterval) {
-      logger.warn('Symbol scanner already running');
-      return false;
-    }
-
-    logger.info(`Starting symbol scanner (interval: ${intervalMinutes} minutes)`);
-
-    // Run initial scan
-    this.scanSymbols().catch(error => {
-      logger.error('Initial scan failed', { error: error.message });
-    });
-
-    // Schedule periodic scans
-    this.scanInterval = setInterval(() => {
-      this.scanSymbols().catch(error => {
-        logger.error('Scheduled scan failed', { error: error.message });
-      });
-    }, intervalMinutes * 60 * 1000);
-
-    logger.info('Symbol scanner started');
-    return true;
-  }
-
-  stop() {
-    if (this.scanInterval) {
-      clearInterval(this.scanInterval);
-      this.scanInterval = null;
-      logger.info('Symbol scanner stopped');
-      return true;
-    }
+  /**
+   * Start scanner - NOT USED ANYMORE
+   * Scanner is now called directly by AutoTrader
+   */
+  start() {
+    logger.warn('SymbolScanner.start() is deprecated - scanner is now called directly by AutoTrader');
     return false;
   }
 
+  stop() {
+    logger.info('Symbol scanner stop() called - no-op since scanner is called directly');
+    return true;
+  }
+
   isRunning() {
-    return this.scanInterval !== null;
+    return this.isScanning;
   }
 }
 

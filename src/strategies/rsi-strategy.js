@@ -72,12 +72,17 @@ class RSIStrategy extends BaseStrategy {
    */
   async analyze(symbol, marketData) {
     try {
+      logger.info(`📊 [RSI Strategy] Starting analysis for ${symbol}`);
+      
       const { klines } = marketData;
 
       // Extract closing prices
       const closes = klines.map(k => parseFloat(k[4]));
 
+      logger.debug(`[RSI Strategy] ${symbol}: Using ${closes.length} candles for calculation`);
+
       if (closes.length < this.rsiPeriod + this.emaTrend + 1) {
+        logger.debug(`❌ [RSI Strategy] ${symbol}: Insufficient data (${closes.length} candles)`);
         return null;
       }
 
@@ -92,9 +97,15 @@ class RSIStrategy extends BaseStrategy {
       const emaTrend = this.calculateEMA(closes, this.emaTrend);
       const currentPrice = closes[closes.length - 1];
 
+      logger.info(`📈 [RSI Strategy] ${symbol}: Price=${currentPrice.toFixed(6)}, RSI=${rsi.toFixed(2)}, EMA50=${emaTrend.toFixed(6)}`);
+      logger.info(`📉 [RSI Strategy] ${symbol}: Previous RSI=${prevRsi.toFixed(2)}`);
+
       // Determine trend
       const isUpTrend = currentPrice > emaTrend;
       const isDownTrend = currentPrice < emaTrend;
+
+      logger.info(`🎯 [RSI Strategy] ${symbol}: Trend=${isUpTrend ? 'UP' : isDownTrend ? 'DOWN' : 'SIDEWAYS'}`);
+      logger.info(`🔍 [RSI Strategy] ${symbol}: RSI Level - Oversold(<${this.oversoldLevel})=${rsi < this.oversoldLevel}, Overbought(>${this.overboughtLevel})=${rsi > this.overboughtLevel}`);
 
       // Detect RSI signals
       const rsiOversold = rsi < this.oversoldLevel && prevRsi >= this.oversoldLevel;
@@ -120,12 +131,14 @@ class RSIStrategy extends BaseStrategy {
         signal = 'BUY';
         reasons.push('RSI oversold');
         reasons.push('Uptrend confirmed');
+        logger.info(`✅ [RSI Strategy] ${symbol}: STRONG LONG signal (oversold + uptrend), confidence=85%`);
       } else if (bullishDivergence) {
         // Strong divergence signal
         confidence = 0.8;
         side = 'LONG';
         signal = 'BUY';
         reasons.push('Bullish divergence');
+        logger.info(`✅ [RSI Strategy] ${symbol}: STRONG LONG signal (bullish divergence), confidence=80%`);
       } else if (rsiOverbought && isDownTrend) {
         // Strong sell signal - overbought in downtrend
         confidence = 0.85;
@@ -133,24 +146,30 @@ class RSIStrategy extends BaseStrategy {
         signal = 'SELL';
         reasons.push('RSI overbought');
         reasons.push('Downtrend confirmed');
+        logger.info(`✅ [RSI Strategy] ${symbol}: STRONG SHORT signal (overbought + downtrend), confidence=85%`);
       } else if (bearishDivergence) {
         // Strong divergence signal
         confidence = 0.8;
         side = 'SHORT';
         signal = 'SELL';
         reasons.push('Bearish divergence');
+        logger.info(`✅ [RSI Strategy] ${symbol}: STRONG SHORT signal (bearish divergence), confidence=80%`);
       } else if (rsi < this.oversoldLevel) {
         // Moderate buy - just oversold
         confidence = 0.5;
         side = 'LONG';
         signal = 'BUY';
         reasons.push('RSI oversold (weak)');
+        logger.info(`✅ [RSI Strategy] ${symbol}: WEAK LONG signal (oversold only), confidence=50%`);
       } else if (rsi > this.overboughtLevel) {
         // Moderate sell - just overbought
         confidence = 0.5;
         side = 'SHORT';
         signal = 'SELL';
         reasons.push('RSI overbought (weak)');
+        logger.info(`✅ [RSI Strategy] ${symbol}: WEAK SHORT signal (overbought only), confidence=50%`);
+      } else {
+        logger.info(`❌ [RSI Strategy] ${symbol}: No signal - RSI in neutral zone (${rsi.toFixed(2)})`);
       }
 
       // Calculate support/resistance levels
