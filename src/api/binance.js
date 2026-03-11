@@ -194,9 +194,13 @@ class BinanceFuturesAPI {
       side, // 'BUY' or 'SELL'
       type, // 'MARKET', 'LIMIT', 'STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET'
       quantity,
-      timeInForce,
       recvWindow,
     };
+
+    // Only add timeInForce for LIMIT orders (not for MARKET, STOP_MARKET, TAKE_PROFIT_MARKET)
+    if (type === 'LIMIT') {
+      params.timeInForce = timeInForce;
+    }
 
     if (price) params.price = price;
     if (stopPrice) params.stopPrice = stopPrice;
@@ -276,9 +280,13 @@ class BinanceFuturesAPI {
       side,
       type,
       quantity,
-      timeInForce,
       recvWindow,
     };
+
+    // Only add timeInForce for LIMIT orders
+    if (type === 'LIMIT') {
+      params.timeInForce = timeInForce;
+    }
 
     if (price) params.price = price;
 

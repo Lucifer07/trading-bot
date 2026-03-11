@@ -1,13 +1,17 @@
 const axios = require('axios');
 const logger = require('./logger');
 const { config } = require('../config');
+const WebSocketScanner = require('../api/ws-scanner');
 
 class SymbolScanner {
-  constructor(redis, telegram) {
+  constructor(redis, telegram, wsScanner = null) {
     this.redis = redis;
     this.telegram = telegram;
     this.baseUrl = config.binance.baseUrl;
     this.isScanning = false;
+
+    // WebSocket scanner for ticker data
+    this.wsScanner = wsScanner || new WebSocketScanner();
   }
 
   async getExchangeInfo() {
@@ -175,7 +179,114 @@ class SymbolScanner {
       const scanStartTime = Date.now();
 
       try {
-        logger.info('Starting symbol scan...');
+        logger.info('Starting symbol scan with WebSocket...');
+
+        // Check if WebSocket scanner is connected
+        if (!this.wsScanner.isConnected) {
+          logger.warn('WebSocket scanner not connected, falling back to REST API');
+          return await this.scanSymbolsREST();
+        }
+
+        // Get top 100 symbols by volume from WebSocket (instead of scanning all 533)
+        const topTickers = this.wsScanner.getTopSymbolsByVolume(533);
+        logger.info(`Found ${topTickers.length} top USDT symbols by volume (from WebSocket)`);
+
+        // Parallel processing with batching
+        const BATCH_SIZE = 20; // Process 20 symbols at a time
+        const results = [];
+        let processed = 0;
+
+        // Split symbols into batches
+        for (let i = 0; i < topTickers.length; i += BATCH_SIZE) {
+          const batch = topTickers.slice(i, i + BATCH_SIZE);
+
+          // Process batch in parallel
+          const batchPromises = batch.map(async (ticker) => {
+            try {
+              const symbol = ticker.s;
+
+              // Get klines from REST API (ticker already from WebSocket)
+              const klines = await this.getKlines(symbol, '1h', 200);
+              if (!klines || klines.length < 50) return null;
+
+              const atr = this.calculateATR(klines, 14);
+              const rsi = this.calculateRSI(klines, 14);
+              const trend = this.calculateTrend(klines);
+              const profitPotential = this.calculateProfitPotential(ticker, klines, atr);
+
+              return {
+                symbol,
+                price: parseFloat(ticker.c), // Use WebSocket ticker price
+                volume: parseFloat(ticker.q), // Use WebSocket ticker volume
+                priceChange: parseFloat(ticker.P), // Use WebSocket ticker price change percent
+                volatility: atr / parseFloat(ticker.c),
+                rsi,
+                trend,
+                profitPotential,
+                atr,
+                // Store full data for strategies to use
+                klines,
+                trades: [], // Will be fetched by strategies if needed
+                ticker,
+                scannedAt: new Date().toISOString(),
+                dataSource: 'websocket', // Indicate data source
+              };
+            } catch (error) {
+              logger.debug('Error analyzing symbol', { symbol: ticker.s, error: error.message });
+              return null;
+            }
+          });
+
+          // Wait for batch to complete
+          const batchResults = await Promise.all(batchPromises);
+
+          // Filter out null results and add to main results
+          results.push(...batchResults.filter(r => r !== null));
+
+          processed += batch.length;
+          logger.info(`Scan progress: ${processed}/${topTickers.length}`);
+        }
+
+        // Sort by profit potential
+        results.sort((a, b) => b.profitPotential - a.profitPotential);
+
+        const scanDuration = ((Date.now() - scanStartTime) / 1000).toFixed(2);
+        logger.info(`✅ Symbol scan completed in ${scanDuration}s`, {
+          totalSymbols: results.length,
+          topScore: results[0]?.profitPotential || 0,
+          dataSource: 'WebSocket',
+        });
+
+        // Save to Redis for backup/reference
+        await this.saveToRedis(results);
+
+        this.isScanning = false;
+
+        // Return results for immediate use by AutoTrader
+        return results;
+
+      } catch (error) {
+        this.isScanning = false;
+        logger.error('Symbol scan failed', { error: error.message, stack: error.stack });
+        throw error;
+      }
+    }
+
+  /**
+   * Fallback: Scan symbols using REST API (if WebSocket not available)
+   * This is less efficient but serves as a backup
+   */
+  async scanSymbolsREST() {
+      if (this.isScanning) {
+        logger.warn('Symbol scan already in progress, skipping...');
+        return null;
+      }
+
+      this.isScanning = true;
+      const scanStartTime = Date.now();
+
+      try {
+        logger.info('Starting symbol scan (REST API fallback)...');
 
         // Get exchange info
         const exchangeInfo = await this.getExchangeInfo();
@@ -211,11 +322,6 @@ class SymbolScanner {
               const trend = this.calculateTrend(klines);
               const profitPotential = this.calculateProfitPotential(ticker, klines, atr);
 
-              // Log RSI calculation for debugging
-              if (symbol === 'ARIAUSDT' || symbol === 'DEGOUSDT' || symbol === 'BOBUSDT') {
-                logger.info(`[SymbolScanner] ${symbol}: RSI=${rsi.toFixed(2)} (from ${klines.length} candles), Price=${parseFloat(ticker.lastPrice).toFixed(6)}`);
-              }
-
               return {
                 symbol,
                 price: parseFloat(ticker.lastPrice),
@@ -226,11 +332,11 @@ class SymbolScanner {
                 trend,
                 profitPotential,
                 atr,
-                // Store full data for strategies to use
                 klines,
-                trades: [], // Will be fetched by strategies if needed
+                trades: [],
                 ticker,
                 scannedAt: new Date().toISOString(),
+                dataSource: 'rest_api',
               };
             } catch (error) {
               logger.debug('Error analyzing symbol', { symbol, error: error.message });
@@ -252,22 +358,23 @@ class SymbolScanner {
         results.sort((a, b) => b.profitPotential - a.profitPotential);
 
         const scanDuration = ((Date.now() - scanStartTime) / 1000).toFixed(2);
-        logger.info(`Symbol scan completed in ${scanDuration}s`, {
+        logger.info(`✅ Symbol scan completed in ${scanDuration}s (REST API)`, {
           totalSymbols: results.length,
           topScore: results[0]?.profitPotential || 0,
+          dataSource: 'REST API',
         });
 
         // Save to Redis for backup/reference
         await this.saveToRedis(results);
 
         this.isScanning = false;
-        
+
         // Return results for immediate use by AutoTrader
         return results;
 
       } catch (error) {
         this.isScanning = false;
-        logger.error('Symbol scan failed', { error: error.message, stack: error.stack });
+        logger.error('Symbol scan failed (REST API)', { error: error.message, stack: error.stack });
         throw error;
       }
     }

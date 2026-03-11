@@ -3,6 +3,7 @@ const logger = require('./utils/logger');
 const { config, validateConfig } = require('./config');
 const BinanceFuturesAPI = require('./api/binance');
 const BinanceWebSocketClient = require('./api/binance-ws');
+const WebSocketScanner = require('./api/ws-scanner');
 const RiskCalculator = require('./risk/calculator');
 const { getDatabase } = require('./storage/db');
 const { getRedis } = require('./storage/redis');
@@ -20,6 +21,7 @@ class TradingBot {
     // Initialize components
     this.api = new BinanceFuturesAPI();
     this.ws = new BinanceWebSocketClient();
+    this.wsScanner = new WebSocketScanner(); // WebSocket scanner for all symbols
     this.riskCalculator = new RiskCalculator();
     this.db = getDatabase();
     this.redis = getRedis();
@@ -30,8 +32,13 @@ class TradingBot {
     this.openPositions = new Map();
     this.pendingOrders = new Map();
 
-    // Symbol Scanner
-    this.symbolScanner = new SymbolScanner(this.redis, this.telegram);
+    // WebSocket data caches (to avoid REST API calls)
+    this.klineCache = new Map(); // symbol -> klines array
+    this.tickerCache = new Map(); // symbol -> ticker data
+    this.bookTickerCache = new Map(); // symbol -> best bid/ask
+
+    // Symbol Scanner (with WebSocket scanner)
+    this.symbolScanner = new SymbolScanner(this.redis, this.telegram, this.wsScanner);
 
     // Auto-trading
     this.autoTrader = new AutoTrader({
@@ -45,6 +52,8 @@ class TradingBot {
       useMultiConfirmation: true, // Enable multi-confirmation strategy
       scanInterval: 180000, // 3 minutes - sync with SymbolScanner
       symbolScanner: this.symbolScanner, // Pass scanner reference
+      positionCache: this.openPositions, // Pass position cache from websocket
+      bot: this, // Pass TradingBot instance for accessing cached data
     });
   }
 
@@ -69,6 +78,14 @@ class TradingBot {
       // Test Redis connection
       await this.redis.testConnection();
       logger.info('✅ Redis connected');
+
+      // Connect to WebSocket scanner (all symbols)
+      await this.wsScanner.connect();
+      const wsStats = this.wsScanner.getStats();
+      logger.info('✅ WebSocket scanner connected', {
+        totalSymbols: wsStats.totalSymbols,
+        usdtSymbols: wsStats.usdtSymbols,
+      });
 
       // Test Binance API connection
       const binanceStatus = await this.api.testConnection();
@@ -204,6 +221,7 @@ class TradingBot {
 
       // Close WebSocket connections
       this.ws.disconnectAll();
+      this.wsScanner.disconnect();
 
       // Close database connection
       await this.db.close();
@@ -224,12 +242,67 @@ class TradingBot {
 
   async subscribeToMarketData(symbols) {
     try {
-      this.ws.subscribeMiniTicker(symbols, (data) => {
-        logger.debug('Mini ticker update', { symbol: data.s, price: data.c });
-        // Process ticker data for signals
+      // Subscribe to klines (1h) for indicators
+      this.ws.subscribeKlines(symbols, '1h', (data) => {
+        if (data.e === 'kline' && data.k) {
+          const kline = data.k;
+          const symbol = kline.s;
+
+          // Update kline cache
+          if (!this.klineCache.has(symbol)) {
+            this.klineCache.set(symbol, []);
+          }
+
+          const klineArray = [
+            kline.t, // Open time
+            parseFloat(kline.o), // Open
+            parseFloat(kline.h), // High
+            parseFloat(kline.l), // Low
+            parseFloat(kline.c), // Close
+            parseFloat(kline.v), // Volume
+            kline.T, // Close time
+            parseFloat(kline.q), // Quote asset volume
+            kline.n, // Number of trades
+            parseFloat(kline.v), // Taker buy base asset volume
+            parseFloat(kline.q), // Taker buy quote asset volume
+            kline.x ? 1 : 0, // Ignore
+          ];
+
+          const klines = this.klineCache.get(symbol);
+
+          // Update last kline or add new one
+          if (klines.length > 0 && klines[klines.length - 1][0] === kline.t) {
+            klines[klines.length - 1] = klineArray;
+          } else {
+            klines.push(klineArray);
+            // Keep only last 200 klines
+            if (klines.length > 200) {
+              klines.shift();
+            }
+          }
+
+          logger.debug('Kline updated', { symbol, timestamp: kline.t, close: kline.c });
+        }
       });
 
-      logger.info('Subscribed to market data', { symbols });
+      // Subscribe to ticker for price updates
+      this.ws.subscribeTicker(symbols, (data) => {
+        if (data.e === '24hrTicker') {
+          this.tickerCache.set(data.s, data);
+          logger.debug('Ticker updated', { symbol: data.s, price: data.c });
+        }
+      });
+
+      // Subscribe to book ticker for best bid/ask
+      this.ws.subscribeBookTicker(symbols, (data) => {
+        this.bookTickerCache.set(data.s, data);
+        logger.debug('Book ticker updated', { symbol: data.s, bid: data.b, ask: data.a });
+      });
+
+      logger.info('✅ Subscribed to market data streams', {
+        symbols,
+        streams: ['klines_1h', 'ticker', 'bookTicker'],
+      });
     } catch (error) {
       logger.error('Failed to subscribe to market data', { error: error.message });
     }
@@ -281,6 +354,7 @@ class TradingBot {
             side: positionSize > 0 ? 'LONG' : 'SHORT',
             size: Math.abs(positionSize),
             entryPrice: parseFloat(pos.ep),
+            markPrice: parseFloat(pos.mp || pos.ep), // Add mark price for current valuation
             unrealizedPnL: parseFloat(pos.up),
             percentage: parseFloat(pos.upnl),
           });
@@ -597,6 +671,118 @@ class TradingBot {
       logger.error('Failed to deactivate kill switch', { error: error.message });
       throw error;
     }
+  }
+
+  // Get cached klines or fallback to REST API
+  async getKlines(symbol, interval = '1h', limit = 200) {
+    try {
+      // Try to get from cache first
+      if (this.klineCache.has(symbol)) {
+        const cachedKlines = this.klineCache.get(symbol);
+
+        if (cachedKlines.length >= limit) {
+          logger.debug('Using cached klines', { symbol, count: cachedKlines.length });
+          return cachedKlines.slice(-limit);
+        } else {
+          logger.debug('Cache has insufficient klines, falling back to API', {
+            symbol,
+            cached: cachedKlines.length,
+            required: limit,
+          });
+        }
+      }
+
+      // Fallback to REST API
+      logger.debug('Fetching klines from REST API', { symbol, interval, limit });
+      const klines = await this.api.getKlines(symbol, interval, limit);
+
+      // Update cache
+      this.klineCache.set(symbol, klines);
+
+      return klines;
+    } catch (error) {
+      logger.error('Failed to get klines', { symbol, error: error.message });
+      throw error;
+    }
+  }
+
+  // Get cached ticker or fallback to REST API
+  async getTicker(symbol) {
+    try {
+      // Try to get from cache first
+      if (this.tickerCache.has(symbol)) {
+        const ticker = this.tickerCache.get(symbol);
+        logger.debug('Using cached ticker', { symbol, price: ticker.c });
+        return ticker;
+      }
+
+      // Fallback to REST API
+      logger.debug('Fetching ticker from REST API', { symbol });
+      const ticker = await this.api.getTickerPrice(symbol);
+
+      // Update cache
+      this.tickerCache.set(symbol, { s: symbol, c: ticker.price, ...ticker });
+
+      return { s: symbol, c: ticker.price, ...ticker };
+    } catch (error) {
+      logger.error('Failed to get ticker', { symbol, error: error.message });
+      throw error;
+    }
+  }
+
+  // Get cached book ticker or fallback to REST API
+  async getBookTicker(symbol) {
+    try {
+      // Try to get from cache first
+      if (this.bookTickerCache.has(symbol)) {
+        const bookTicker = this.bookTickerCache.get(symbol);
+        logger.debug('Using cached book ticker', { symbol, bid: bookTicker.b, ask: bookTicker.a });
+        return bookTicker;
+      }
+
+      // Fallback to REST API
+      logger.debug('Fetching book ticker from REST API', { symbol });
+      const bookTicker = await this.api.getBookTicker(symbol);
+
+      // Update cache
+      this.bookTickerCache.set(symbol, bookTicker);
+
+      return bookTicker;
+    } catch (error) {
+      logger.error('Failed to get book ticker', { symbol, error: error.message });
+      throw error;
+    }
+  }
+
+  // Subscribe to symbols' market data
+  async subscribeToSymbols(symbols) {
+    if (!symbols || symbols.length === 0) {
+      logger.warn('No symbols to subscribe to');
+      return;
+    }
+
+    // Disconnect existing connections for old symbols
+    this.ws.disconnectAll();
+
+    // Subscribe to new symbols
+    await this.subscribeToMarketData(symbols);
+
+    // Clear caches for old symbols
+    const newSymbolSet = new Set(symbols);
+    for (const symbol of this.klineCache.keys()) {
+      if (!newSymbolSet.has(symbol)) {
+        this.klineCache.delete(symbol);
+        this.tickerCache.delete(symbol);
+        this.bookTickerCache.delete(symbol);
+      }
+    }
+
+    logger.info('Subscribed to symbols', {
+      symbols,
+      klineCacheSize: this.klineCache.size,
+      tickerCacheSize: this.tickerCache.size,
+      bookTickerCacheSize: this.bookTickerCache.size,
+    });
   }
 }
 

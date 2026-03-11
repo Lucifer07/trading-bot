@@ -24,6 +24,8 @@ class AutoTrader {
     this.riskCalculator = config.riskCalculator;
     this.paperTrading = config.paperTrading || false;
     this.tradingEnabled = config.tradingEnabled || false;
+    this.positionCache = config.positionCache || new Map();
+    this.bot = config.bot; // TradingBot instance for accessing cached data
 
     // Exchange info cache for tick sizes and step sizes
     this.exchangeInfoCache = null;
@@ -38,6 +40,10 @@ class AutoTrader {
 
     // Initialize with current balance
     this.updateTier(config.api.accountBalance || 60);
+
+    // Track last position verification time to reduce API calls
+    this.lastPositionVerificationTime = 0;
+    this.positionVerificationInterval = 60000; // Verify positions every 60 seconds max
 
     // Initialize signal aggregator with tier-specific config + multi-confirmation support
     this.signalAggregator = new SignalAggregator({
@@ -306,8 +312,20 @@ class AutoTrader {
         logger.info('\n🔄 ========== Starting new cycle ==========');
 
         // 0. CRITICAL: Verify all open positions exist in Binance
+        // Only verify periodically (every 60 seconds) to avoid rate limits
         if (!this.paperTrading) {
-          await this.verifyAllPositions();
+          const now = Date.now();
+          const timeSinceLastVerification = now - this.lastPositionVerificationTime;
+
+          if (timeSinceLastVerification >= this.positionVerificationInterval) {
+            await this.verifyAllPositions();
+            this.lastPositionVerificationTime = now;
+          } else {
+            logger.debug('Skipping position verification (too soon)', {
+              timeSinceLastVerification: Math.floor(timeSinceLastVerification / 1000) + 's',
+              interval: Math.floor(this.positionVerificationInterval / 1000) + 's',
+            });
+          }
         }
 
         // 1. Scan symbols
@@ -329,11 +347,19 @@ class AutoTrader {
         const openTrades = await this.db.getOpenTrades();
         if (openTrades.length > 0) {
           logger.info('📱 Step 2: Sending Telegram notification (have open trades)...');
-          await this.sendTopOpportunitiesNotification(top10.slice(0, 5)).catch(err => {
+          await this.sendTopOpportunitiesNotification(top.slice(0, 5)).catch(err => {
             logger.error('Failed to send Telegram notification', { error: err.message });
           });
         } else {
           logger.info('⏭️  Step 2: Skipping Telegram notification (no open trades)');
+        }
+
+        // 4. Subscribe to new symbols via WebSocket (to avoid REST API calls)
+        if (this.bot && !this.paperTrading) {
+          logger.info('📡 Step 3: Subscribing to symbols via WebSocket...', { symbols: this.symbols });
+          await this.bot.subscribeToSymbols(this.symbols).catch(err => {
+            logger.error('Failed to subscribe to symbols', { error: err.message });
+          });
         }
         
         // 4. Analyze symbols
@@ -448,19 +474,63 @@ class AutoTrader {
   }
 
   /**
-   * Fetch market data from Redis (cached by SymbolScanner) or Binance
+   * Fetch market data from WebSocket cache or Binance API
    */
   async fetchMarketData(symbol) {
       try {
+        // Try to get from WebSocket cache first (if bot is available)
+        if (this.bot && !this.paperTrading) {
+          try {
+            // Get klines from WebSocket cache
+            const klines = await this.bot.getKlines(symbol, '1h', 200);
+
+            // Get ticker from WebSocket cache
+            const ticker = await this.bot.getTicker(symbol);
+
+            // Get 24h ticker for volume data (may need REST API fallback)
+            let ticker24h;
+            try {
+              ticker24h = await this.api.get24hrTicker(symbol);
+            } catch (e) {
+              // Use cached ticker if available
+              ticker24h = ticker;
+            }
+
+            // Fetch recent trades (not cached, but less critical)
+            const trades = await this.api.getRecentTrades(symbol, 100).catch(() => null);
+
+            const currentPrice = parseFloat(ticker.c);
+
+            return {
+              symbol,
+              klines,
+              trades: trades || [],
+              currentPrice,
+              volume: parseFloat(ticker24h?.v || ticker24h?.volume || 0),
+              quoteVolume: parseFloat(ticker24h?.q || ticker24h?.quoteVolume || 0),
+              high: parseFloat(ticker24h?.h || ticker24h?.highPrice || currentPrice),
+              low: parseFloat(ticker24h?.l || ticker24h?.lowPrice || currentPrice),
+              change: parseFloat(ticker24h?.p || ticker24h?.priceChangePercent || 0),
+              fromCache: true,
+              cacheSource: 'websocket',
+            };
+          } catch (wsError) {
+            logger.debug('WebSocket cache unavailable, falling back to REST API', {
+              symbol,
+              error: wsError.message,
+            });
+          }
+        }
+
         // Try to get from Redis first (from SymbolScanner)
         const cachedData = await this.getSymbolDataFromRedis(symbol);
-        
+
         if (cachedData && cachedData.klines && cachedData.klines.length >= 50) {
-          logger.debug(`Using cached market data for ${symbol} (age: ${this.getCacheAge(cachedData.scannedAt)}s)`);
-          
+          logger.debug(`Using Redis cached market data for ${symbol} (age: ${this.getCacheAge(cachedData.scannedAt)}s)`);
+
           // Fetch recent trades separately (not cached by scanner)
           const trades = await this.api.getRecentTrades(symbol, 100).catch(() => null);
-          
+
           return {
             symbol,
             klines: cachedData.klines,
@@ -472,12 +542,13 @@ class AutoTrader {
             low: parseFloat(cachedData.ticker?.lowPrice || cachedData.price),
             change: cachedData.priceChange,
             fromCache: true,
+            cacheSource: 'redis',
           };
         }
-        
-        // Fallback: Fetch from Binance if not in cache
-        logger.debug(`Cache miss for ${symbol}, fetching from Binance`);
-        
+
+        // Last fallback: Fetch from Binance REST API
+        logger.debug(`Cache miss for ${symbol}, fetching from Binance REST API`);
+
         // PARALLEL: Fetch all market data at once (including trades for CVD)
         const [klines, ticker, ticker24h, trades] = await Promise.all([
           this.api.getKlines(symbol, '1h', 200),
@@ -499,6 +570,7 @@ class AutoTrader {
           low: parseFloat(ticker24h.lowPrice),
           change: parseFloat(ticker24h.priceChangePercent),
           fromCache: false,
+          cacheSource: 'rest_api',
         };
 
       } catch (error) {
@@ -841,7 +913,7 @@ class AutoTrader {
         symbol: trade.symbol,
         side: takeProfitSide,
         order_type: 'TAKE_PROFIT_MARKET',
-        quantity: positionResult.positionSize,
+        quantity: trade.quantity,
         price: trade.take_profit,
         status: 'OPEN',
       });
@@ -1023,6 +1095,7 @@ class AutoTrader {
   async checkTradeStatus(trade) {
     try {
       // CRITICAL: Verify trade actually exists in Binance
+      // This now uses cached position data, avoiding REST API calls
       if (!this.paperTrading) {
         const positionExists = await this.verifyPositionExists(trade);
         if (!positionExists) {
@@ -1043,8 +1116,33 @@ class AutoTrader {
       }
 
       // Get current price
-      const ticker = await this.api.getTickerPrice(trade.symbol);
-      const currentPrice = parseFloat(ticker.price);
+      let currentPrice;
+
+      // Try WebSocket cache first (if bot is available)
+      if (!this.paperTrading && this.bot) {
+        try {
+          const ticker = await this.bot.getTicker(trade.symbol);
+          currentPrice = parseFloat(ticker.c);
+          logger.debug('Using cached ticker price from WebSocket', { symbol: trade.symbol, price: currentPrice });
+        } catch (wsError) {
+          logger.debug('WebSocket ticker unavailable, trying position cache', { symbol: trade.symbol });
+        }
+      }
+
+      // Fallback to position cache
+      if (!currentPrice && !this.paperTrading && this.positionCache && this.positionCache.has(trade.symbol)) {
+        // Use cached price from websocket position data (includes mark price)
+        const cachedPosition = this.positionCache.get(trade.symbol);
+        currentPrice = cachedPosition.markPrice || cachedPosition.entryPrice;
+        logger.debug('Using cached price from position cache', { symbol: trade.symbol, price: currentPrice });
+      }
+
+      // Last fallback: REST API
+      if (!currentPrice) {
+        const ticker = await this.api.getTickerPrice(trade.symbol);
+        currentPrice = parseFloat(ticker.price);
+        logger.debug('Using price from REST API (fallback)', { symbol: trade.symbol, price: currentPrice });
+      }
 
       // Check if stop loss or take profit hit
       let shouldClose = false;
@@ -1119,9 +1217,49 @@ class AutoTrader {
 
   /**
    * Verify position exists in Binance
+   * Uses websocket position cache to avoid rate limits
+   * Falls back to REST API only if cache is empty or in paper trading mode
    */
   async verifyPositionExists(trade) {
     try {
+      // First, try to use cached position data from websocket (much faster, no rate limit)
+      if (!this.paperTrading && this.positionCache && this.positionCache.has(trade.symbol)) {
+        const cachedPosition = this.positionCache.get(trade.symbol);
+        
+        if (cachedPosition && cachedPosition.size > 0.01) {
+          logger.debug('Position verified from cache (websocket)', {
+            symbol: trade.symbol,
+            side: cachedPosition.side,
+            size: cachedPosition.size,
+            entryPrice: cachedPosition.entryPrice,
+          });
+          return true;
+        } else {
+          logger.warn('Position not in cache or size too small', {
+            symbol: trade.symbol,
+            tradeId: trade.trade_id,
+            cachedPosition,
+          });
+          return false;
+        }
+      }
+
+      // Fallback: Only use REST API if:
+      // 1. In paper trading mode, OR
+      // 2. No position cache available (paper trading)
+      // This significantly reduces API calls
+      if (this.paperTrading) {
+        // In paper trading, we simulate positions
+        logger.debug('Paper trading mode - position verification skipped');
+        return true;
+      }
+
+      // Last resort: Use REST API (this should rarely happen now)
+      logger.warn('Using REST API fallback for position verification', {
+        symbol: trade.symbol,
+        tradeId: trade.trade_id,
+      });
+
       const positions = await this.api.getPositions(trade.symbol);
 
       if (!positions || positions.length === 0) {
@@ -1142,7 +1280,7 @@ class AutoTrader {
         return false;
       }
 
-      logger.debug('Position verified in Binance', {
+      logger.debug('Position verified in Binance (REST API fallback)', {
         symbol: trade.symbol,
         positionAmt: position.positionAmt,
         entryPrice: position.entryPrice,
@@ -1235,23 +1373,53 @@ class AutoTrader {
           total_risk_exposure: 0,
         });
       } else {
-        // Live trading: get real balance from Binance
+        // Live trading: use cached data from websocket to avoid rate limits
         try {
-          const balance = await this.api.getTotalWalletBalance();
-          const unrealizedPnL = await this.api.getUnrealizedPnL();
-          const positions = await this.api.getPositions();
-          
+          let balance;
+          let unrealizedPnL;
+          let openPositionsCount;
+
+          // Try to use cached data from websocket (if available)
+          if (this.positionCache && this.positionCache.size > 0) {
+            // Calculate total unrealized PnL from cached positions
+            unrealizedPnL = Array.from(this.positionCache.values())
+              .reduce((sum, pos) => sum + (pos.unrealizedPnL || 0), 0);
+            openPositionsCount = this.positionCache.size;
+
+            // For balance, we still need to make one API call to get the total wallet balance
+            // This is much less frequent than before (only on trade close)
+            balance = await this.api.getTotalWalletBalance();
+
+            logger.debug('Using cached position data for snapshot', {
+              balance: balance.toFixed(2),
+              unrealizedPnL: unrealizedPnL.toFixed(2),
+              openPositionsCount,
+            });
+          } else {
+            // Fallback to REST API (only if cache is not available)
+            balance = await this.api.getTotalWalletBalance();
+            unrealizedPnL = await this.api.getUnrealizedPnL();
+            const positions = await this.api.getPositions();
+            openPositionsCount = positions.filter(p => parseFloat(p.positionAmt) !== 0).length;
+
+            logger.warn('Using REST API fallback for snapshot', {
+              balance: balance.toFixed(2),
+              unrealizedPnL: unrealizedPnL.toFixed(2),
+              openPositionsCount,
+            });
+          }
+
           // Update tier after balance change
           this.updateTier(balance);
-          
+
           await this.db.createSnapshot({
             balance: balance,
             equity: balance + unrealizedPnL,
             unrealized_pnl: unrealizedPnL,
-            open_positions_count: positions.filter(p => parseFloat(p.positionAmt) !== 0).length,
+            open_positions_count: openPositionsCount,
             total_risk_exposure: 0,
           });
-          
+
           logger.info('Account snapshot created', {
             balance: balance.toFixed(2),
             equity: (balance + unrealizedPnL).toFixed(2),
