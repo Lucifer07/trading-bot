@@ -105,6 +105,16 @@ class Database {
     return (await this.query(query, ['OPEN'])).rows;
   }
 
+  async getPendingTrades() {
+    const query = 'SELECT * FROM trades WHERE status = $1 ORDER BY entry_time DESC';
+    return (await this.query(query, ['PENDING'])).rows;
+  }
+
+  async getFailedTrades(limit = 100) {
+    const query = 'SELECT * FROM trades WHERE status = $1 ORDER BY entry_time DESC LIMIT $2';
+    return (await this.query(query, ['FAILED', limit])).rows;
+  }
+
   async getClosedTrades(limit = 100) {
     const query = 'SELECT * FROM trades WHERE status = $1 ORDER BY entry_time DESC LIMIT $2';
     return (await this.query(query, ['CLOSED', limit])).rows;

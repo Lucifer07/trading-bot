@@ -25,6 +25,10 @@ class AutoTrader {
     this.paperTrading = config.paperTrading || false;
     this.tradingEnabled = config.tradingEnabled || false;
 
+    // Exchange info cache for tick sizes and step sizes
+    this.exchangeInfoCache = null;
+    this.symbolInfoCache = {};
+
     // Survival tracking
     this.currentTier = null;
     this.consecutiveLosses = 0;
@@ -75,6 +79,124 @@ class AutoTrader {
       tradingEnabled: this.tradingEnabled,
       newsCheckEnabled: this.newsChecker.enabled,
     });
+  }
+
+  /**
+   * Get exchange info and cache it
+   */
+  async loadExchangeInfo() {
+    try {
+      if (!this.exchangeInfoCache) {
+        const exchangeInfo = await this.api.getExchangeInfo();
+        this.exchangeInfoCache = exchangeInfo;
+
+        logger.info('✅ Exchange info loaded', {
+          symbols: exchangeInfo.symbols.length,
+          serverTime: exchangeInfo.serverTime,
+        });
+      }
+      return this.exchangeInfoCache;
+    } catch (error) {
+      logger.error('Failed to load exchange info', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Get symbol info including tick size and step size
+   */
+  async getSymbolInfo(symbol) {
+    try {
+      if (!this.symbolInfoCache[symbol]) {
+        const exchangeInfo = await this.loadExchangeInfo();
+        const symbolData = exchangeInfo.symbols.find(s => s.symbol === symbol);
+
+        if (!symbolData) {
+          throw new Error(`Symbol ${symbol} not found in exchange info`);
+        }
+
+        const priceFilter = symbolData.filters.find(f => f.filterType === 'PRICE_FILTER');
+        const lotSizeFilter = symbolData.filters.find(f => f.filterType === 'LOT_SIZE');
+
+        this.symbolInfoCache[symbol] = {
+          symbol: symbolData.symbol,
+          status: symbolData.status,
+          baseAsset: symbolData.baseAsset,
+          quoteAsset: symbolData.quoteAsset,
+          tickSize: parseFloat(priceFilter.tickSize),
+          minPrice: parseFloat(priceFilter.minPrice),
+          maxPrice: parseFloat(priceFilter.maxPrice),
+          stepSize: parseFloat(lotSizeFilter.stepSize),
+          minQty: parseFloat(lotSizeFilter.minQty),
+          maxQty: parseFloat(lotSizeFilter.maxQty),
+          pricePrecision: this.countDecimals(priceFilter.tickSize),
+          qtyPrecision: this.countDecimals(lotSizeFilter.stepSize),
+        };
+
+        logger.debug('Symbol info cached', {
+          symbol,
+          tickSize: this.symbolInfoCache[symbol].tickSize,
+          stepSize: this.symbolInfoCache[symbol].stepSize,
+          pricePrecision: this.symbolInfoCache[symbol].pricePrecision,
+          qtyPrecision: this.symbolInfoCache[symbol].qtyPrecision,
+        });
+      }
+
+      return this.symbolInfoCache[symbol];
+    } catch (error) {
+      logger.error('Failed to get symbol info', { symbol, error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Round price to exchange precision using tick size
+   */
+  roundPrice(symbol, price) {
+    const tickSize = this.symbolInfoCache[symbol]?.tickSize || 0.01;
+
+    const roundedPrice = Math.floor(price / tickSize) * tickSize;
+
+    return roundedPrice;
+  }
+
+  /**
+   * Round quantity to exchange precision using step size
+   */
+  roundQuantity(symbol, quantity) {
+    const stepSize = this.symbolInfoCache[symbol]?.stepSize || 0.001;
+
+    const roundedQty = Math.floor(quantity / stepSize) * stepSize;
+
+    return roundedQty;
+  }
+
+  /**
+   * Count number of decimal places in a number
+   */
+  countDecimals(value) {
+    if (value === 0) return 0;
+
+    const str = value.toString();
+    if (str.indexOf('.') === -1) return 0;
+
+    return str.split('.')[1].length;
+  }
+
+  /**
+   * Format price for display/log
+   */
+  formatPrice(symbol, price) {
+    const precision = this.symbolInfoCache[symbol]?.pricePrecision || 2;
+    return price.toFixed(precision);
+  }
+
+  /**
+   * Format quantity for display/log
+   */
+  formatQuantity(symbol, quantity) {
+    const precision = this.symbolInfoCache[symbol]?.qtyPrecision || 3;
+    return quantity.toFixed(precision);
   }
 
   /**
@@ -145,6 +267,12 @@ class AutoTrader {
     this.isRunning = true;
     logger.info('🚀 Starting Auto Trader with integrated scanning');
 
+    // Load exchange info for price/quantity precision
+    await this.loadExchangeInfo();
+
+    // CRITICAL: Cleanup orphan trades first
+    await this.cleanupOrphanTrades();
+
     // Load existing open trades
     await this.loadOpenTrades();
 
@@ -176,22 +304,27 @@ class AutoTrader {
     while (this.isRunning) {
       try {
         logger.info('\n🔄 ========== Starting new cycle ==========');
-        
+
+        // 0. CRITICAL: Verify all open positions exist in Binance
+        if (!this.paperTrading) {
+          await this.verifyAllPositions();
+        }
+
         // 1. Scan symbols
         logger.info('📡 Step 1: Scanning symbols...');
         const scanResults = await this.symbolScanner.scanSymbols();
-        
+
         if (!scanResults || scanResults.length === 0) {
           logger.warn('No scan results, waiting 10s before retry...');
           await this.sleep(10000);
           continue;
         }
-        
+
         // 2. Update symbols from scan (top 10)
         const top10 = scanResults.slice(0, 10);
         this.symbols = top10.map(r => r.symbol);
         logger.info(`✅ Symbols updated: ${this.symbols.join(', ')}`);
-        
+
         // 3. Send Telegram notification for top 5 (only if we have open trades)
         const openTrades = await this.db.getOpenTrades();
         if (openTrades.length > 0) {
@@ -450,8 +583,18 @@ class AutoTrader {
         return;
       }
 
+      // Get symbol info for proper tick size
+      const symbolInfo = await this.getSymbolInfo(signal.symbol);
+      logger.info('📐 Symbol info loaded', {
+        symbol: signal.symbol,
+        tickSize: symbolInfo.tickSize,
+        stepSize: symbolInfo.stepSize,
+        pricePrecision: symbolInfo.pricePrecision,
+        qtyPrecision: symbolInfo.qtyPrecision,
+      });
+
       // Calculate position size using tier-specific risk
-      const tickSize = 0.01;
+      const tickSize = symbolInfo.tickSize;
       const riskPercent = this.emergencyMode ? 0.5 : this.currentTier.riskPerTrade;
 
       // Calculate position size WITH FEES (critical for survival!)
@@ -470,52 +613,127 @@ class AutoTrader {
         return;
       }
 
-      // Create trade record
       const { v4: uuidv4 } = require('uuid');
       const tradeId = uuidv4();
+
+      logger.info('🎯 [Step 1] Creating trade record with PENDING status', {
+        tradeId,
+        symbol: signal.symbol,
+        side: signal.side,
+        paperTrading: this.paperTrading,
+      });
+
+      // Round all prices to exchange precision
+      const roundedEntryPrice = this.roundPrice(signal.symbol, signal.entryPrice);
+      const roundedStopLoss = this.roundPrice(signal.symbol, signal.stopLoss);
+      const roundedTakeProfit = this.roundPrice(signal.symbol, signal.takeProfit);
+      const roundedQuantity = this.roundQuantity(signal.symbol, positionResult.positionSize);
+
+      logger.info('📐 Prices rounded to exchange precision', {
+        symbol: signal.symbol,
+        tickSize: tickSize,
+        stepSize: symbolInfo.stepSize,
+        originalEntry: signal.entryPrice,
+        roundedEntry: roundedEntryPrice,
+        originalSL: signal.stopLoss,
+        roundedSL: roundedStopLoss,
+        originalTP: signal.takeProfit,
+        roundedTP: roundedTakeProfit,
+        originalQty: positionResult.positionSize,
+        roundedQty: roundedQuantity,
+      });
 
       const trade = await this.db.createTrade({
         trade_id: tradeId,
         symbol: signal.symbol,
         side: signal.side,
-        entry_price: signal.entryPrice,
-        quantity: positionResult.positionSize,
-        stop_loss: signal.stopLoss,
-        take_profit: signal.takeProfit,
+        entry_price: roundedEntryPrice,
+        quantity: roundedQuantity,
+        stop_loss: roundedStopLoss,
+        take_profit: roundedTakeProfit,
         risk_amount: positionResult.riskAmount,
         risk_percent: positionResult.riskPercent,
+        status: 'PENDING',
         strategy: `Auto-Trading-${this.currentTier.name}`,
         notes: JSON.stringify({
           ...signal,
           tier: this.currentTier.name,
           emergencyMode: this.emergencyMode,
+          paperTrading: this.paperTrading,
+          pricePrecision: symbolInfo.pricePrecision,
+          qtyPrecision: symbolInfo.qtyPrecision,
+          tickSize: tickSize,
         }),
       });
 
-      logger.info('🎯 Trade executed', {
-        tradeId,
-        symbol: signal.symbol,
-        side: signal.side,
-        tier: this.currentTier.name,
-        entryPrice: signal.entryPrice,
-        stopLoss: signal.stopLoss,
-        takeProfit: signal.takeProfit,
-        quantity: positionResult.positionSize,
-        riskAmount: positionResult.riskAmount.toFixed(2),
-        riskPercent: riskPercent + '%',
-        confidence: (signal.confidence * 100).toFixed(1) + '%',
-        paperTrading: this.paperTrading,
-        emergencyMode: this.emergencyMode,
-      });
+      let orderResult = null;
 
-      if (this.paperTrading) {
-        await this.executePaperOrders(trade, positionResult);
-      } else {
-        await this.executeBinanceOrders(trade, positionResult);
+      try {
+        logger.info('🎯 [Step 2] Executing orders', {
+          tradeId,
+          mode: this.paperTrading ? 'PAPER' : 'LIVE',
+        });
+
+        if (this.paperTrading) {
+          orderResult = await this.executePaperOrders(trade);
+        } else {
+          orderResult = await this.executeBinanceOrders(trade);
+        }
+
+        if (!orderResult || !orderResult.success) {
+          throw new Error('Order execution failed - invalid response');
+        }
+
+        logger.info('🎯 [Step 3] Orders executed successfully, updating trade to OPEN', {
+          tradeId,
+          ordersPlaced: orderResult.ordersPlaced,
+        });
+
+        await this.db.updateTrade(tradeId, {
+          status: 'OPEN',
+          exchange_order_ids: orderResult.orderIds,
+          orders_placed_at: new Date(),
+        });
+
+        logger.info('✅ [Step 4] Trade successfully OPEN', {
+          tradeId,
+          symbol: signal.symbol,
+          side: signal.side,
+          tier: this.currentTier.name,
+          entryPrice: roundedEntryPrice.toFixed(symbolInfo.pricePrecision),
+          stopLoss: roundedStopLoss.toFixed(symbolInfo.pricePrecision),
+          takeProfit: roundedTakeProfit.toFixed(symbolInfo.pricePrecision),
+          quantity: roundedQuantity.toFixed(symbolInfo.qtyPrecision),
+          riskAmount: positionResult.riskAmount.toFixed(2),
+          riskPercent: riskPercent + '%',
+          confidence: (signal.confidence * 100).toFixed(1) + '%',
+          paperTrading: this.paperTrading,
+          emergencyMode: this.emergencyMode,
+          orderIds: orderResult.orderIds,
+          tickSize: tickSize,
+          stepSize: symbolInfo.stepSize,
+        });
+
+        this.tradeCount++;
+        this.openTrades.set(tradeId, { ...trade, status: 'OPEN' });
+
+      } catch (error) {
+        logger.error('❌ [CRITICAL] Order execution failed, marking trade as FAILED', {
+          tradeId,
+          symbol: signal.symbol,
+          error: error.message,
+          stack: error.stack,
+        });
+
+        await this.db.updateTrade(tradeId, {
+          status: 'FAILED',
+          exit_price: roundedEntryPrice,
+          exit_time: new Date(),
+          exit_reason: `Order execution failed: ${error.message}`,
+        });
+
+        throw error;
       }
-
-      this.tradeCount++;
-      this.openTrades.set(tradeId, trade);
 
     } catch (error) {
       logger.error('Execute trade error', {
@@ -529,19 +747,36 @@ class AutoTrader {
   /**
    * Execute orders on Binance
    */
-  async executeBinanceOrders(trade, positionResult) {
+  async executeBinanceOrders(trade) {
+    const { v4: uuidv4 } = require('uuid');
+    const orderIds = [];
+
     try {
-      // Set leverage
-      await this.api.changeLeverage(trade.symbol, 3); // 3x leverage
+      logger.info('📡 [Binance] Setting leverage', { symbol: trade.symbol, leverage: 3 });
+      await this.api.changeLeverage(trade.symbol, 3);
 
-      // Place market order
+      logger.info('📡 [Binance] Placing market order', {
+        symbol: trade.symbol,
+        side: trade.side,
+        quantity: trade.quantity,
+      });
+
       const orderSide = trade.side === 'LONG' ? 'BUY' : 'SELL';
-      const marketOrder = await this.api.createMarketOrder(trade.symbol, orderSide, positionResult.positionSize);
+      const marketOrder = await this.api.createMarketOrder(trade.symbol, orderSide, trade.quantity);
 
-      // Create order record
-      const { v4: uuidv4 } = require('uuid');
+      if (!marketOrder || !marketOrder.orderId) {
+        throw new Error('Market order failed - no orderId returned');
+      }
+
+      logger.info('✅ [Binance] Market order filled', {
+        orderId: marketOrder.orderId,
+        executedQty: marketOrder.executedQty,
+        price: marketOrder.avgPrice || marketOrder.price,
+      });
+
+      orderIds.push(marketOrder.orderId.toString());
+
       const orderId = uuidv4();
-
       await this.db.createOrder({
         order_id: orderId,
         trade_id: trade.trade_id,
@@ -549,103 +784,211 @@ class AutoTrader {
         symbol: trade.symbol,
         side: orderSide,
         order_type: 'MARKET',
-        quantity: positionResult.positionSize,
+        quantity: trade.quantity,
         status: 'FILLED',
-        filled_quantity: positionResult.positionSize,
+        filled_quantity: parseFloat(marketOrder.executedQty),
+        price: parseFloat(marketOrder.avgPrice || marketOrder.price),
       });
 
-      // Place stop loss order
+      logger.info('📡 [Binance] Placing stop loss order', {
+        symbol: trade.symbol,
+        stopLoss: trade.stop_loss,
+      });
+
       const stopLossSide = trade.side === 'LONG' ? 'SELL' : 'BUY';
-      const slOrder = await this.api.createStopLossOrder(trade.symbol, stopLossSide, positionResult.positionSize, trade.stop_loss);
+      const slOrder = await this.api.createStopLossOrder(trade.symbol, stopLossSide, trade.quantity, trade.stop_loss);
 
-      // Place take profit order
+      if (!slOrder || !slOrder.orderId) {
+        throw new Error('Stop loss order failed - no orderId returned');
+      }
+
+      logger.info('✅ [Binance] Stop loss order placed', { orderId: slOrder.orderId });
+      orderIds.push(slOrder.orderId.toString());
+
+      const slOrderId = uuidv4();
+      await this.db.createOrder({
+        order_id: slOrderId,
+        trade_id: trade.trade_id,
+        exchange_order_id: slOrder.orderId.toString(),
+        symbol: trade.symbol,
+        side: stopLossSide,
+        order_type: 'STOP_MARKET',
+        quantity: trade.quantity,
+        price: trade.stop_loss,
+        status: 'OPEN',
+      });
+
+      logger.info('📡 [Binance] Placing take profit order', {
+        symbol: trade.symbol,
+        takeProfit: trade.take_profit,
+      });
+
       const takeProfitSide = trade.side === 'LONG' ? 'SELL' : 'BUY';
-      const tpOrder = await this.api.createTakeProfitOrder(trade.symbol, takeProfitSide, positionResult.positionSize, trade.take_profit);
+      const tpOrder = await this.api.createTakeProfitOrder(trade.symbol, takeProfitSide, trade.quantity, trade.take_profit);
 
-      logger.info('✅ Orders placed on Binance', {
+      if (!tpOrder || !tpOrder.orderId) {
+        throw new Error('Take profit order failed - no orderId returned');
+      }
+
+      logger.info('✅ [Binance] Take profit order placed', { orderId: tpOrder.orderId });
+      orderIds.push(tpOrder.orderId.toString());
+
+      const tpOrderId = uuidv4();
+      await this.db.createOrder({
+        order_id: tpOrderId,
+        trade_id: trade.trade_id,
+        exchange_order_id: tpOrder.orderId.toString(),
+        symbol: trade.symbol,
+        side: takeProfitSide,
+        order_type: 'TAKE_PROFIT_MARKET',
+        quantity: positionResult.positionSize,
+        price: trade.take_profit,
+        status: 'OPEN',
+      });
+
+      logger.info('✅ [Binance] All orders placed successfully', {
+        tradeId: trade.trade_id,
         marketOrderId: marketOrder.orderId,
         stopLossOrderId: slOrder.orderId,
         takeProfitOrderId: tpOrder.orderId,
       });
 
+      return {
+        success: true,
+        ordersPlaced: 3,
+        orderIds,
+        marketOrder: marketOrder.orderId.toString(),
+        stopLossOrder: slOrder.orderId.toString(),
+        takeProfitOrder: tpOrder.orderId.toString(),
+      };
+
     } catch (error) {
-      logger.error('Execute Binance orders error', {
+      logger.error('❌ [Binance] Order execution failed', {
         symbol: trade.symbol,
+        tradeId: trade.trade_id,
         error: error.message,
+        stack: error.stack,
       });
-      throw error;
+
+      return {
+        success: false,
+        error: error.message,
+        ordersPlaced: orderIds.length,
+        orderIds,
+      };
     }
   }
 
   /**
    * Execute orders in paper trading mode
    */
-  async executePaperOrders(trade, positionResult) {
+  async executePaperOrders(trade) {
     try {
-      // Simulate order execution
       const { v4: uuidv4 } = require('uuid');
+      const orderIds = [];
 
-      // Create simulated market order
+      logger.info('📝 [Paper] Simulating market order', {
+        symbol: trade.symbol,
+        side: trade.side,
+        quantity: trade.quantity,
+      });
+
       const marketOrderId = uuidv4();
+      const paperMarketOrderId = 'PAPER-' + marketOrderId;
+      orderIds.push(paperMarketOrderId);
+
       await this.db.createOrder({
         order_id: marketOrderId,
         trade_id: trade.trade_id,
-        exchange_order_id: 'PAPER-' + marketOrderId,
+        exchange_order_id: paperMarketOrderId,
         symbol: trade.symbol,
         side: trade.side === 'LONG' ? 'BUY' : 'SELL',
         order_type: 'MARKET',
-        quantity: positionResult.positionSize,
+        quantity: trade.quantity,
+        price: trade.entry_price,
         status: 'FILLED',
-        filled_quantity: positionResult.positionSize,
+        filled_quantity: trade.quantity,
         created_at: new Date(),
         updated_at: new Date(),
         filled_at: new Date(),
       });
 
-      // Create simulated stop loss order
+      logger.info('✅ [Paper] Simulating stop loss order', {
+        symbol: trade.symbol,
+        stopLoss: trade.stop_loss,
+      });
+
       const slOrderId = uuidv4();
+      const paperSlOrderId = 'PAPER-SL-' + slOrderId;
+      orderIds.push(paperSlOrderId);
+
       await this.db.createOrder({
         order_id: slOrderId,
         trade_id: trade.trade_id,
-        exchange_order_id: 'PAPER-SL-' + slOrderId,
+        exchange_order_id: paperSlOrderId,
         symbol: trade.symbol,
         side: trade.side === 'LONG' ? 'SELL' : 'BUY',
         order_type: 'STOP_MARKET',
-        quantity: positionResult.positionSize,
+        quantity: trade.quantity,
         price: trade.stop_loss,
         status: 'OPEN',
         created_at: new Date(),
         updated_at: new Date(),
       });
 
-      // Create simulated take profit order
+      logger.info('✅ [Paper] Simulating take profit order', {
+        symbol: trade.symbol,
+        takeProfit: trade.take_profit,
+      });
+
       const tpOrderId = uuidv4();
+      const paperTpOrderId = 'PAPER-TP-' + tpOrderId;
+      orderIds.push(paperTpOrderId);
+
       await this.db.createOrder({
         order_id: tpOrderId,
         trade_id: trade.trade_id,
-        exchange_order_id: 'PAPER-TP-' + tpOrderId,
+        exchange_order_id: paperTpOrderId,
         symbol: trade.symbol,
         side: trade.side === 'LONG' ? 'SELL' : 'BUY',
         order_type: 'TAKE_PROFIT_MARKET',
-        quantity: positionResult.positionSize,
+        quantity: trade.quantity,
         price: trade.take_profit,
         status: 'OPEN',
         created_at: new Date(),
         updated_at: new Date(),
       });
 
-      logger.info('📝 Paper orders simulated', {
-        marketOrderId,
-        stopLossOrderId: slOrderId,
-        takeProfitOrderId: tpOrderId,
+      logger.info('✅ [Paper] All orders simulated successfully', {
+        tradeId: trade.trade_id,
+        marketOrderId: paperMarketOrderId,
+        stopLossOrderId: paperSlOrderId,
+        takeProfitOrderId: paperTpOrderId,
       });
 
+      return {
+        success: true,
+        ordersPlaced: 3,
+        orderIds,
+        marketOrder: paperMarketOrderId,
+        stopLossOrder: paperSlOrderId,
+        takeProfitOrder: paperTpOrderId,
+      };
+
     } catch (error) {
-      logger.error('Execute paper orders error', {
+      logger.error('❌ [Paper] Order simulation failed', {
         symbol: trade.symbol,
+        tradeId: trade.trade_id,
         error: error.message,
+        stack: error.stack,
       });
-      throw error;
+
+      return {
+        success: false,
+        error: error.message,
+        ordersPlaced: orderIds.length,
+        orderIds,
+      };
     }
   }
 
@@ -679,6 +1022,26 @@ class AutoTrader {
    */
   async checkTradeStatus(trade) {
     try {
+      // CRITICAL: Verify trade actually exists in Binance
+      if (!this.paperTrading) {
+        const positionExists = await this.verifyPositionExists(trade);
+        if (!positionExists) {
+          logger.error('❌ [CRITICAL] Trade in DB but NOT in Binance - marking as FAILED', {
+            tradeId: trade.trade_id,
+            symbol: trade.symbol,
+          });
+
+          await this.db.updateTrade(trade.trade_id, {
+            status: 'FAILED',
+            exit_time: new Date(),
+            exit_reason: 'Position not found in Binance - orphan trade detected',
+          });
+
+          this.openTrades.delete(trade.trade_id);
+          return;
+        }
+      }
+
       // Get current price
       const ticker = await this.api.getTickerPrice(trade.symbol);
       const currentPrice = parseFloat(ticker.price);
@@ -718,10 +1081,113 @@ class AutoTrader {
   }
 
   /**
+   * Verify all open positions exist in Binance
+   */
+  async verifyAllPositions() {
+    try {
+      const openTrades = await this.db.getOpenTrades();
+
+      if (openTrades.length === 0) {
+        return;
+      }
+
+      logger.info('🔍 Verifying all open positions in Binance', { count: openTrades.length });
+
+      for (const trade of openTrades) {
+        const exists = await this.verifyPositionExists(trade);
+        if (!exists) {
+          logger.error('❌ Orphan trade detected - marking as FAILED', {
+            tradeId: trade.trade_id,
+            symbol: trade.symbol,
+          });
+
+          await this.db.updateTrade(trade.trade_id, {
+            status: 'FAILED',
+            exit_price: trade.entry_price,
+            exit_time: new Date(),
+            exit_reason: 'Orphan trade - position not found in Binance',
+          });
+
+          this.openTrades.delete(trade.trade_id);
+        }
+      }
+
+    } catch (error) {
+      logger.error('Verify all positions error', { error: error.message });
+    }
+  }
+
+  /**
+   * Verify position exists in Binance
+   */
+  async verifyPositionExists(trade) {
+    try {
+      const positions = await this.api.getPositions(trade.symbol);
+
+      if (!positions || positions.length === 0) {
+        logger.warn('No positions found for symbol', { symbol: trade.symbol });
+        return false;
+      }
+
+      const position = positions.find(p => {
+        const posSize = parseFloat(p.positionAmt);
+        return Math.abs(posSize) > 0.01;
+      });
+
+      if (!position) {
+        logger.warn('No open position found for trade', {
+          symbol: trade.symbol,
+          tradeId: trade.trade_id,
+        });
+        return false;
+      }
+
+      logger.debug('Position verified in Binance', {
+        symbol: trade.symbol,
+        positionAmt: position.positionAmt,
+        entryPrice: position.entryPrice,
+      });
+
+      return true;
+
+    } catch (error) {
+      logger.error('Verify position exists error', {
+        tradeId: trade.trade_id,
+        symbol: trade.symbol,
+        error: error.message,
+      });
+      return false;
+    }
+  }
+
+  /**
    * Close a trade
    */
   async closeTrade(trade, exitPrice, reason) {
     try {
+      // CRITICAL: Verify position exists before closing (only for live trading)
+      if (!this.paperTrading) {
+        const positionExists = await this.verifyPositionExists(trade);
+        if (!positionExists) {
+          logger.error('❌ [CRITICAL] Attempting to close trade but NO position in Binance!', {
+            tradeId: trade.trade_id,
+            symbol: trade.symbol,
+            exitPrice,
+            reason,
+          });
+
+          await this.db.updateTrade(trade.trade_id, {
+            status: 'FAILED',
+            exit_price: exitPrice,
+            exit_time: new Date(),
+            exit_reason: `Orphan trade - position never created in Binance. Original reason: ${reason}`,
+          });
+
+          this.openTrades.delete(trade.trade_id);
+          return;
+        }
+      }
+
       // Calculate profit/loss
       const priceDifference = trade.side === 'LONG'
         ? exitPrice - trade.entry_price
@@ -827,6 +1293,45 @@ class AutoTrader {
         tradeId: trade.trade_id,
         error: error.message,
       });
+    }
+  }
+
+  /**
+   * Cleanup orphan trades (PENDING > 5 minutes)
+   */
+  async cleanupOrphanTrades() {
+    try {
+      const pendingTrades = await this.db.getPendingTrades();
+      let cleaned = 0;
+
+      for (const trade of pendingTrades) {
+        const age = Date.now() - new Date(trade.created_at || trade.entry_time).getTime();
+        const ageMinutes = age / (1000 * 60);
+
+        if (ageMinutes > 5) {
+          logger.warn('🧹 Cleaning up orphan PENDING trade', {
+            tradeId: trade.trade_id,
+            symbol: trade.symbol,
+            ageMinutes: ageMinutes.toFixed(1),
+          });
+
+          await this.db.updateTrade(trade.trade_id, {
+            status: 'FAILED',
+            exit_price: trade.entry_price,
+            exit_time: new Date(),
+            exit_reason: `Orphan trade - PENDING timeout after ${ageMinutes.toFixed(1)} minutes`,
+          });
+
+          cleaned++;
+        }
+      }
+
+      if (cleaned > 0) {
+        logger.info('🧹 Orphan trade cleanup completed', { cleaned });
+      }
+
+    } catch (error) {
+      logger.error('Cleanup orphan trades error', { error: error.message });
     }
   }
 

@@ -15,13 +15,15 @@ CREATE TABLE IF NOT EXISTS trades (
     risk_percent DECIMAL(5, 2) NOT NULL,
     profit_loss DECIMAL(20, 8),
     profit_loss_percent DECIMAL(10, 2),
-    status VARCHAR(20) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED', 'CANCELLED', 'PARTIAL')),
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'OPEN', 'CLOSED', 'CANCELLED', 'PARTIAL', 'FAILED')),
     entry_time TIMESTAMP NOT NULL DEFAULT NOW(),
     exit_time TIMESTAMP,
     duration_seconds INTEGER,
     strategy VARCHAR(100),
     indicators JSONB,
     notes TEXT,
+    exchange_order_ids JSONB,
+    orders_placed_at TIMESTAMP,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
