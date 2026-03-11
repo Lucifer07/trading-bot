@@ -1,0 +1,16 @@
+177c
+      // Start symbol scanner (runs every 5 minutes)
+      this.symbolScanner.start(5);
+      logger.info('✅ Symbol scanner started (interval: 5 minutes)');
+
+      // Start auto-trading automatically
+      if (this.tradingEnabled) {
+        logger.info('🤖 Starting Auto Trader automatically...');
+        await this.startAutoTrader();
+      } else {
+        logger.info('⚠️ Trading is disabled, Auto Trader not started');
+      }
+
+      return true;
+.
+178,181d

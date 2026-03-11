@@ -27,62 +27,63 @@ class BinanceFuturesAPI {
   }
 
   async request(endpoint, method = 'GET', params = {}, signed = false) {
-    try {
-      let url = `${this.baseUrl}${endpoint}`;
+      try {
+        // Add signature for signed requests
+        if (signed && this.apiKey && this.secretKey) {
+          params = signParams(params, this.secretKey);
+        }
 
-      // Add signature for signed requests
-      if (signed && this.apiKey && this.secretKey) {
-        params = signParams(params, this.secretKey);
+        // Build query string - must maintain same order and encoding as signature
+        // signParams already sorts and encodes, so we need to do the same here
+        const queryString = Object.keys(params)
+          .sort()
+          .map((key) => `${key}=${encodeURIComponent(params[key])}`)
+          .join('&');
+
+        // For Binance API, all parameters (including POST) go in query string
+        let url = `${this.baseUrl}${endpoint}`;
+        if (queryString) {
+          url += `?${queryString}`;
+        }
+
+        const headers = {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        };
+
+        if (this.apiKey) {
+          headers['X-MBX-APIKEY'] = this.apiKey;
+        }
+
+        const response = await axios({
+          method,
+          url,
+          headers,
+          timeout: 10000,
+        });
+
+        // Log API request
+        // await this.db.logEvent({
+        //   event_type: 'api_request',
+        //   severity: 'INFO',
+        //   message: `${method} ${endpoint}`,
+        //   data: { params: { ...params, signature: '***' }, status: response.status },
+        // });
+
+        return response.data;
+      } catch (error) {
+        const errorMessage = error.response?.data?.msg || error.message;
+        logger.error('Binance API error', { endpoint, error: errorMessage });
+
+        // await this.db.logEvent({
+        //   event_type: 'api_error',
+        //   severity: 'ERROR',
+        //   message: `${method} ${endpoint} failed`,
+        //   data: { params: { ...params, signature: '***' }, error: errorMessage },
+        // });
+
+        throw new Error(`Binance API Error: ${errorMessage}`);
       }
-
-      // Build query string
-      const queryString = Object.keys(params)
-        .map((key) => `${key}=${encodeURIComponent(params[key])}`)
-        .join('&');
-
-      if (method === 'GET' && queryString) {
-        url += `?${queryString}`;
-      }
-
-      const headers = {
-        'Content-Type': 'application/json',
-      };
-
-      if (this.apiKey) {
-        headers['X-MBX-APIKEY'] = this.apiKey;
-      }
-
-      const response = await axios({
-        method,
-        url,
-        headers,
-        data: method !== 'GET' ? queryString : undefined,
-        timeout: 10000,
-      });
-
-      // Log API request
-      // await this.db.logEvent({
-      //   event_type: 'api_request',
-      //   severity: 'INFO',
-      //   message: `${method} ${endpoint}`,
-      //   data: { params: { ...params, signature: '***' }, status: response.status },
-      // });
-
-      return response.data;
-    } catch (error) {
-      const errorMessage = error.response?.data?.msg || error.message;
-      logger.error('Binance API error', { endpoint, error: errorMessage });
-
-      // await this.db.logEvent({
-      //   event_type: 'api_error',
-      //   severity: 'ERROR',
-      //   message: `${method} ${endpoint} failed`,
-      //   data: { params: { ...params, signature: '***' }, error: errorMessage },
-      // });
-
-      throw new Error(`Binance API Error: ${errorMessage}`);
     }
-  }
 
   // Public endpoints
   async getExchangeInfo(symbol = null) {

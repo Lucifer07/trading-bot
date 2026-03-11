@@ -321,8 +321,8 @@ class AutoTrader {
         }
 
         // 2. Update symbols from scan (top 10)
-        const top10 = scanResults.slice(0, 10);
-        this.symbols = top10.map(r => r.symbol);
+        const top = scanResults.slice(0, 30);
+        this.symbols = top.map(r => r.symbol);
         logger.info(`✅ Symbols updated: ${this.symbols.join(', ')}`);
 
         // 3. Send Telegram notification for top 5 (only if we have open trades)
