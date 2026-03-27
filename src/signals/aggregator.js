@@ -102,13 +102,14 @@ class SignalAggregator {
       }
       
       // Determine trend direction
-      const ema20 = ema20History[ema20History.length - 1];
-      const ema50 = ema50History[ema50History.length - 1];
+      // Get latest EMA values from history
+      const latestEma20 = ema20History[ema20History.length - 1];
+      const latestEma50 = ema50History[ema50History.length - 1];
       
       let trendDirection = 'SIDEWAYS';
-      if (currentPrice > ema20 && currentPrice > ema50 && ema20 > ema50) {
+      if (currentPrice > latestEma20 && currentPrice > latestEma50 && latestEma20 > latestEma50) {
         trendDirection = 'UP';
-      } else if (currentPrice < ema20 && currentPrice < ema50 && ema20 < ema50) {
+      } else if (currentPrice < latestEma20 && currentPrice < latestEma50 && latestEma20 < latestEma50) {
         trendDirection = 'DOWN';
       }
       

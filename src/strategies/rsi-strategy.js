@@ -203,7 +203,6 @@ class RSIStrategy extends BaseStrategy {
       // Calculate support/resistance levels
       const low = Math.min(...closes.slice(-50));
       const high = Math.max(...closes.slice(-50));
-      const atr = this.calculateATR(klines.slice(-14));
 
       // Determine stop loss and take profit
       let stopLoss, takeProfit;
@@ -369,9 +368,6 @@ class RSIStrategy extends BaseStrategy {
     return adx;
   }
 
-    const atr = trueRanges.slice(-period).reduce((sum, tr) => sum + tr, 0) / period;
-    return atr;
-  }
 }
 
 module.exports = RSIStrategy;

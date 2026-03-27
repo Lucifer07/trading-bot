@@ -165,7 +165,6 @@ class EMACrossoverStrategy extends BaseStrategy {
       // Calculate support/resistance levels
       const low = Math.min(...closes.slice(-50));
       const high = Math.max(...closes.slice(-50));
-      const atr = this.calculateATR(klines.slice(-14));
 
       // Determine stop loss and take profit
       let stopLoss, takeProfit;
