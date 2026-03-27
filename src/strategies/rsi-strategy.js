@@ -16,11 +16,16 @@ class RSIStrategy extends BaseStrategy {
     this.oversoldLevel = config.oversoldLevel || 30;
     this.overboughtLevel = config.overboughtLevel || 70;
     this.emaTrend = config.emaTrend || 50;
+    
+    this.minATR = config.minATR || 0.8; // 0.8% minimum volatility
+    this.minADX = config.minADX || 25; // 25 minimum ADX for trend strength
 
     logger.info('RSI Strategy initialized', {
       rsiPeriod: this.rsiPeriod,
       oversoldLevel: this.oversoldLevel,
       overboughtLevel: this.overboughtLevel,
+      minATR: this.minATR,
+      minADX: this.minADX,
     });
   }
 
@@ -106,6 +111,29 @@ class RSIStrategy extends BaseStrategy {
 
       logger.info(`🎯 [RSI Strategy] ${symbol}: Trend=${isUpTrend ? 'UP' : isDownTrend ? 'DOWN' : 'SIDEWAYS'}`);
       logger.info(`🔍 [RSI Strategy] ${symbol}: RSI Level - Oversold(<${this.oversoldLevel})=${rsi < this.oversoldLevel}, Overbought(>${this.overboughtLevel})=${rsi > this.overboughtLevel}`);
+
+      const atr = this.calculateATR(klines.slice(-14));
+      const atrPercent = (atr / currentPrice) * 100;
+
+      logger.info(`📊 [RSI Strategy] ${symbol}: ATR=${atrPercent.toFixed(2)}% (min required: ${this.minATR}%)`);
+
+      if (atrPercent < this.minATR) {
+        logger.info(`❌ [RSI Strategy] ${symbol}: Volatility too low (${atrPercent.toFixed(2)}% < ${this.minATR}%) - market likely ranging`);
+        return null;
+      }
+
+      const highs = klines.map(k => parseFloat(k[2]));
+      const lows = klines.map(k => parseFloat(k[3]));
+      const adx = this.calculateADX(highs, lows, closes, 14);
+
+      logger.info(`📊 [RSI Strategy] ${symbol}: ADX=${adx.toFixed(2)} (min required: ${this.minADX})`);
+
+      if (adx < this.minADX) {
+        logger.info(`❌ [RSI Strategy] ${symbol}: Trend too weak (ADX: ${adx.toFixed(2)} < ${this.minADX})`);
+        return null;
+      }
+
+      logger.info(`✅ [RSI Strategy] ${symbol}: Volatility and trend strength checks passed`);
 
       // Detect RSI signals
       const rsiOversold = rsi < this.oversoldLevel && prevRsi >= this.oversoldLevel;
@@ -262,9 +290,84 @@ class RSIStrategy extends BaseStrategy {
         Math.abs(high - prevClose),
         Math.abs(low - prevClose)
       );
-
       trueRanges.push(tr);
     }
+
+    const atr = trueRanges.slice(-period).reduce((sum, tr) => sum + tr, 0) / period;
+    return atr;
+  }
+
+  /**
+   * Calculate ADX (Average Directional Index) - Trend strength indicator
+   */
+  calculateADX(highs, lows, closes, period = 14) {
+    if (highs.length < period * 2) return 0;
+    
+    const tr = [];
+    const dmPlus = [];
+    const dmMinus = [];
+    
+    for (let i = 1; i < highs.length; i++) {
+      const high = parseFloat(highs[i]);
+      const low = parseFloat(lows[i]);
+      const prevHigh = parseFloat(highs[i - 1]);
+      const prevLow = parseFloat(lows[i - 1]);
+      const prevClose = parseFloat(closes[i - 1]);
+      
+      const trValue = Math.max(
+        high - low,
+        Math.abs(high - prevClose),
+        Math.abs(low - prevClose)
+      );
+      
+      const upMove = high - prevHigh;
+      const downMove = prevLow - low;
+      
+      let plusDM = 0;
+      let minusDM = 0;
+      
+      if (upMove > downMove && upMove > 0) {
+        plusDM = upMove;
+      }
+      
+      if (downMove > upMove && downMove > 0) {
+        minusDM = downMove;
+      }
+      
+      tr.push(trValue);
+      dmPlus.push(plusDM);
+      dmMinus.push(minusDM);
+    }
+    
+    if (tr.length < period) return 0;
+    
+    let atr = tr.slice(0, period).reduce((sum, val) => sum + val, 0) / period;
+    let diPlus = dmPlus.slice(0, period).reduce((sum, val) => sum + val, 0) / period;
+    let diMinus = dmMinus.slice(0, period).reduce((sum, val) => sum + val, 0) / period;
+    
+    const dxValues = [];
+    
+    for (let i = period; i < tr.length; i++) {
+      atr = (atr * (period - 1) + tr[i]) / period;
+      diPlus = (diPlus * (period - 1) + dmPlus[i]) / period;
+      diMinus = (diMinus * (period - 1) + dmMinus[i]) / period;
+      
+      const sumDI = diPlus + diMinus;
+      
+      if (sumDI === 0) {
+        dxValues.push(0);
+      } else {
+        const dx = Math.abs((diPlus - diMinus) / sumDI) * 100;
+        dxValues.push(dx);
+      }
+    }
+    
+    if (dxValues.length < period) return 0;
+    
+    const adx = dxValues.slice(-period).reduce((sum, val) => sum + val, 0) / period;
+    
+    return adx;
+  }
 
     const atr = trueRanges.slice(-period).reduce((sum, tr) => sum + tr, 0) / period;
     return atr;

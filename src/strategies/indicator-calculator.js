@@ -179,6 +179,78 @@ class IndicatorCalculator {
   }
 
   /**
+   * Calculate ADX (Average Directional Index) - Trend strength indicator
+   */
+  calculateADX(highs, lows, closes, period = 14) {
+    if (highs.length < period * 2) return 0;
+    
+    const tr = [];
+    const dmPlus = [];
+    const dmMinus = [];
+    
+    for (let i = 1; i < highs.length; i++) {
+      const high = parseFloat(highs[i]);
+      const low = parseFloat(lows[i]);
+      const prevHigh = parseFloat(highs[i - 1]);
+      const prevLow = parseFloat(lows[i - 1]);
+      const prevClose = parseFloat(closes[i - 1]);
+      
+      const trValue = Math.max(
+        high - low,
+        Math.abs(high - prevClose),
+        Math.abs(low - prevClose)
+      );
+      
+      const upMove = high - prevHigh;
+      const downMove = prevLow - low;
+      
+      let plusDM = 0;
+      let minusDM = 0;
+      
+      if (upMove > downMove && upMove > 0) {
+        plusDM = upMove;
+      }
+      
+      if (downMove > upMove && downMove > 0) {
+        minusDM = downMove;
+      }
+      
+      tr.push(trValue);
+      dmPlus.push(plusDM);
+      dmMinus.push(minusDM);
+    }
+    
+    if (tr.length < period) return 0;
+    
+    let atr = tr.slice(0, period).reduce((sum, val) => sum + val, 0) / period;
+    let diPlus = dmPlus.slice(0, period).reduce((sum, val) => sum + val, 0) / period;
+    let diMinus = dmMinus.slice(0, period).reduce((sum, val) => sum + val, 0) / period;
+    
+    const dxValues = [];
+    
+    for (let i = period; i < tr.length; i++) {
+      atr = (atr * (period - 1) + tr[i]) / period;
+      diPlus = (diPlus * (period - 1) + dmPlus[i]) / period;
+      diMinus = (diMinus * (period - 1) + dmMinus[i]) / period;
+      
+      const sumDI = diPlus + diMinus;
+      
+      if (sumDI === 0) {
+        dxValues.push(0);
+      } else {
+        const dx = Math.abs((diPlus - diMinus) / sumDI) * 100;
+        dxValues.push(dx);
+      }
+    }
+    
+    if (dxValues.length < period) return 0;
+    
+    const adx = dxValues.slice(-period).reduce((sum, val) => sum + val, 0) / period;
+    
+    return adx;
+  }
+
+  /**
    * Calculate CVD (Cumulative Volume Delta)
    */
   calculateCVD(trades, periods = 10) {
@@ -224,6 +296,12 @@ class IndicatorCalculator {
       const rsi = this.calculateRSI(closes, 14);
       logger.info(`[IndicatorCalculator] ${symbol}: RSI=${rsi.toFixed(2)} (calculated from ${closes.length} candles)`);
       
+      const highs = klines.map(k => parseFloat(k[2]));
+      const lows = klines.map(k => parseFloat(k[3]));
+      const adx = this.calculateADX(highs, lows, closes, 14);
+      
+      logger.info(`[IndicatorCalculator] ${symbol}: ADX=${adx.toFixed(2)} (trend strength indicator)`);
+      
       return {
         ema20: this.calculateEMA(closes, 20),
         ema50: this.calculateEMA(closes, 50),
@@ -237,6 +315,7 @@ class IndicatorCalculator {
         macdSignalHistory,
         macdHistogramPrev,
         atr: this.calculateATR(klines, 14),
+        adx,
         volume: volumes[volumes.length - 1],
         avgVolume: volumes.slice(-20).reduce((sum, v) => sum + v, 0) / 20,
         cvd: trades ? this.calculateCVD(trades, 10) : 0,

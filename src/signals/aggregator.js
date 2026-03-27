@@ -5,13 +5,18 @@ const MultiConfirmationStrategy = require('../strategies/multi-confirmation-stra
 
 class SignalAggregator {
   constructor(config = {}) {
-    this.minConfidence = config.minConfidence || 0.75; // Lowered from 0.7 for survival mode
-    this.minConfluence = config.minConfluence || 2.5;  // Lowered from 2 for survival mode
+    this.minConfidence = config.minConfidence || 0.85; // Increased from 0.75 - higher quality signals
+    this.minConfluence = config.minConfluence || 2.5;  // Risk-reward ratio requirement
     this.maxPositions = config.maxPositions || 2;      // Reduced from 3 for survival mode
-    this.requiredAgreement = config.requiredAgreement || 0.67; // 2 out of 3 strategies must agree
+    this.requiredAgreement = config.requiredAgreement || 0.80; // Increased from 0.67 - 80% agreement required
+    this.useHigherTimeframe = config.useHigherTimeframe !== false; // 4H alignment check enabled by default
+    this.higherTimeframe = config.higherTimeframe || '4h';
 
     // Store config for multi-confirmation strategy
     this.config = config;
+    
+    // API for fetching higher timeframe data
+    this.binanceAPI = config.binanceAPI;
 
     // Initialize strategies - HYBRID APPROACH
     this.strategies = [
@@ -20,11 +25,15 @@ class SignalAggregator {
         enabled: true,
         riskPercent: 1.5,  // Increased from 0.8 for survival mode
         maxPositions: 2,
+        minATR: 0.8,      // 0.8% minimum volatility
+        minADX: 25,       // 25 minimum ADX
       }),
       new RSIStrategy({
         enabled: true,
         riskPercent: 1.5,  // Increased from 0.8 for survival mode
         maxPositions: 2,
+        minATR: 0.8,      // 0.8% minimum volatility
+        minADX: 25,       // 25 minimum ADX
       }),
       // New advanced multi-confirmation strategy
       new MultiConfirmationStrategy({
@@ -47,7 +56,108 @@ class SignalAggregator {
       minConfluence: this.minConfluence,
       requiredAgreement: this.requiredAgreement,
       maxPositions: this.maxPositions,
+      useHigherTimeframe: this.useHigherTimeframe,
+      higherTimeframe: this.higherTimeframe,
     });
+  }
+
+  /**
+   * Fetch higher timeframe market data for alignment check
+   */
+  async fetchHigherTimeframeData(symbol, timeframe = '4h', limit = 100) {
+    if (!this.binanceAPI) {
+      logger.debug('No binanceAPI available, skipping higher timeframe check');
+      return null;
+    }
+    
+    try {
+      const klines = await this.binanceAPI.getKlines(symbol, timeframe, limit);
+      
+      if (!klines || klines.length < 50) {
+        logger.debug(`Insufficient ${timeframe} data for ${symbol}`);
+        return null;
+      }
+      
+      const closes = klines.map(k => parseFloat(k[4]));
+      const currentPrice = closes[closes.length - 1];
+      
+      // Calculate EMAs for higher timeframe
+      const ema20History = [];
+      const ema50History = [];
+      
+      const kVal20 = 2 / (20 + 1);
+      const kVal50 = 2 / (50 + 1);
+      
+      let ema20 = closes.slice(0, 20).reduce((sum, p) => sum + p, 0) / 20;
+      let ema50 = closes.slice(0, 50).reduce((sum, p) => sum + p, 0) / 50;
+      
+      for (let i = 20; i < closes.length; i++) {
+        ema20 = closes[i] * kVal20 + ema20 * (1 - kVal20);
+        ema20History.push(ema20);
+      }
+      
+      for (let i = 50; i < closes.length; i++) {
+        ema50 = closes[i] * kVal50 + ema50 * (1 - kVal50);
+        ema50History.push(ema50);
+      }
+      
+      // Determine trend direction
+      const ema20 = ema20History[ema20History.length - 1];
+      const ema50 = ema50History[ema50History.length - 1];
+      
+      let trendDirection = 'SIDEWAYS';
+      if (currentPrice > ema20 && currentPrice > ema50 && ema20 > ema50) {
+        trendDirection = 'UP';
+      } else if (currentPrice < ema20 && currentPrice < ema50 && ema20 < ema50) {
+        trendDirection = 'DOWN';
+      }
+      
+      return {
+        timeframe,
+        currentPrice,
+        ema20,
+        ema50,
+        trendDirection,
+        data: klines
+      };
+      
+    } catch (error) {
+      logger.error('Fetch higher timeframe data error', { symbol, timeframe, error: error.message });
+      return null;
+    }
+  }
+
+  /**
+   * Check higher timeframe alignment
+   */
+  async checkHigherTimeframeAlignment(symbol, signalSide) {
+    if (!this.useHigherTimeframe) {
+      logger.debug('Higher timeframe check disabled, auto-passing');
+      return { aligned: true, reason: 'Higher timeframe check disabled' };
+    }
+    
+    const h4Data = await this.fetchHigherTimeframeData(symbol, this.higherTimeframe);
+    
+    if (!h4Data) {
+      logger.warn(`Could not fetch ${this.higherTimeframe} data, auto-passing alignment check`);
+      return { aligned: true, reason: 'Higher timeframe data unavailable' };
+    }
+    
+    const aligned = 
+      (signalSide === 'LONG' && h4Data.trendDirection === 'UP') ||
+      (signalSide === 'SHORT' && h4Data.trendDirection === 'DOWN');
+    
+    const reason = aligned
+      ? `${this.higherTimeframe} trend (${h4Data.trendDirection}) aligns with ${signalSide} signal`
+      : `${this.higherTimeframe} trend (${h4Data.trendDirection}) conflicts with ${signalSide} signal`;
+    
+    return {
+      aligned,
+      reason,
+      h4Trend: h4Data.trendDirection,
+      h4EMA20: h4Data.ema20,
+      h4EMA50: h4Data.ema50
+    };
   }
 
   /**
@@ -173,6 +283,18 @@ class SignalAggregator {
         return null;
       }
 
+      // Check higher timeframe alignment
+      logger.info(`   🔍 Checking higher timeframe (${this.higherTimeframe}) alignment...`);
+      const h4Alignment = await this.checkHigherTimeframeAlignment(symbol, side);
+      
+      if (!h4Alignment.aligned) {
+        logger.info(`   ❌ Higher timeframe misalignment: ${h4Alignment.reason}`);
+        logger.info(`❌ [Signal Aggregator] ${symbol}: REJECTED - Higher timeframe misalignment\n`);
+        return null;
+      }
+      
+      logger.info(`   ✅ Higher timeframe aligned: ${h4Alignment.reason}`);
+
       // Calculate aggregated confidence
       const signalsForSide = side === 'LONG' ? bullishSignals : bearishSignals;
       const avgConfidence = signalsForSide.reduce((sum, s) => sum + s.confidence, 0) / signalsForSide.length;
@@ -259,6 +381,7 @@ class SignalAggregator {
         reasons: allReasons,
         signalsCount: signalsForSide.length,
         strategies: signalsForSide.map(s => s.strategy),
+        higherTimeframeAlignment: h4Alignment,
       };
 
       logger.info(`\n✅ [Signal Aggregator] ${symbol}: SIGNAL GENERATED!`);
@@ -267,6 +390,7 @@ class SignalAggregator {
       logger.info(`   Agreement: ${(agreement * 100).toFixed(0)}%`);
       logger.info(`   R/R Ratio: ${riskRewardRatio.toFixed(2)}:1`);
       logger.info(`   Strategies: ${signalsForSide.map(s => s.strategy).join(', ')}`);
+      logger.info(`   ${this.higherTimeframe} Trend: ${h4Alignment.h4Trend || 'N/A'}`);
       logger.info(`${'='.repeat(80)}\n`);
 
       return result;

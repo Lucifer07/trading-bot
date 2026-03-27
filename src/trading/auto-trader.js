@@ -3,6 +3,8 @@ const SignalAggregator = require('../signals/aggregator');
 const { getDatabase } = require('../storage/db');
 const { getTopSymbols } = require('../utils/symbol-scanner');
 const NewsChecker = require('../utils/news-checker');
+const MarketRegimeDetector = require('../strategies/market-regime-detector');
+const DynamicLeverageCalculator = require('../risk/dynamic-leverage-calculator');
 const { 
   SURVIVAL_CONFIG,
   getCurrentTier, 
@@ -45,23 +47,17 @@ class AutoTrader {
     this.lastPositionVerificationTime = 0;
     this.positionVerificationInterval = 60000; // Verify positions every 60 seconds max
 
-    // Initialize signal aggregator with tier-specific config + multi-confirmation support
-    this.signalAggregator = new SignalAggregator({
-      minConfidence: this.currentTier.minConfidence,
-      minConfluence: this.currentTier.minRiskReward,
-      maxPositions: this.currentTier.maxPositions,
-      requiredAgreement: 0.67, // 2 out of 3 strategies must agree
-      useMultiConfirmation: config.useMultiConfirmation !== false, // Enabled by default
-      binanceAPI: config.api, // Pass API for derivatives data
-      redisClient: config.redisClient, // Pass Redis for caching
-    });
+    // Cooldown system to prevent overtrading
+    this.signalCooldownMap = new Map();
+    this.cooldownPeriod = config.cooldownPeriod || 4 * 60 * 60 * 1000; // 4 hours default cooldown
 
-    // Initialize news checker for safety
-    this.newsChecker = new NewsChecker({
-      enabled: config.newsCheckEnabled !== false, // Enabled by default
-      checkInterval: 1* 60 * 1000, // 15 minutes
-      redisClient: config.redisClient, // Pass Redis for caching
-    });
+    // Critical failure tracking for PM2 restart
+    this.priceFetchFailures = new Map(); // symbol -> consecutive failure count
+    this.maxConsecutiveFailures = config.maxConsecutiveFailures || 5; // Max failures before exit
+    this.globalFailureCount = 0;
+    this.maxGlobalFailures = config.maxGlobalFailures || 10; // Max total failures before exit
+    this.lastFailureTime = null;
+    this.failureCooldown = config.failureCooldown || 5 * 60 * 1000; // 5 minutes cooldown for failure tracking
 
     // State
     // State
@@ -383,6 +379,9 @@ class AutoTrader {
    */
   async scan() {
     try {
+      // Reset failure counters periodically
+      this.resetFailureCounters();
+
       // Skip scan if no symbols available yet
       if (this.symbols.length === 0) {
         logger.debug('No symbols available yet, skipping scan');
@@ -421,10 +420,74 @@ class AutoTrader {
   }
 
   /**
+   * Check if symbol is in cooldown period
+   */
+  isSymbolInCooldown(symbol) {
+    const lastSignalTime = this.signalCooldownMap.get(symbol);
+    if (!lastSignalTime) return false;
+
+    const timeSinceLastSignal = Date.now() - lastSignalTime;
+    const timeRemaining = this.cooldownPeriod - timeSinceLastSignal;
+    
+    if (timeRemaining > 0) {
+      return {
+        inCooldown: true,
+        remaining: Math.floor(timeRemaining / 1000 / 60), // minutes
+      };
+    }
+    
+    return { inCooldown: false, remaining: 0 };
+  }
+
+  /**
+   * Set cooldown for symbol
+   */
+  setSymbolCooldown(symbol) {
+    this.signalCooldownMap.set(symbol, Date.now());
+    logger.info(`⏰ [Cooldown] ${symbol}: Cooldown activated (${this.cooldownPeriod / 1000 / 60 / 60} hours)`);
+  }
+
+  /**
+   * Reset failure counters (for periodic cleanup)
+   */
+  resetFailureCounters() {
+    const now = Date.now();
+    const symbolsToReset = [];
+
+    // Check if failure cooldown has passed
+    if (this.lastFailureTime && (now - this.lastFailureTime) > this.failureCooldown) {
+      this.globalFailureCount = 0;
+      this.lastFailureTime = null;
+      logger.debug('🔄 [Failure Reset] Global failure counter reset');
+    }
+
+    // Reset individual symbol failures that are too old
+    for (const [symbol, failureCount] of this.priceFetchFailures.entries()) {
+      const lastFailureTime = this.lastFailureTime;
+      
+      if (!lastFailureTime || (now - lastFailureTime) > this.failureCooldown) {
+        this.priceFetchFailures.delete(symbol);
+        symbolsToReset.push(symbol);
+      }
+    }
+
+    if (symbolsToReset.length > 0) {
+      logger.debug('🔄 [Failure Reset] Reset failures for symbols:', { symbols: symbolsToReset });
+    }
+  }
+
+  /**
    * Scan a single symbol
    */
   async scanSymbol(symbol, openTrades) {
     try {
+      // COOLDOWN CHECK: Prevent overtrading
+      const cooldownStatus = this.isSymbolInCooldown(symbol);
+      if (cooldownStatus.inCooldown) {
+        logger.info(`⏸️  [Cooldown] ${symbol}: In cooldown (${cooldownStatus.remaining} minutes remaining)`);
+        return;
+      }
+
       // SAFETY CHECK: Check news before analyzing
       const newsSafety = await this.newsChecker.checkTradingSafety(symbol);
       
@@ -454,13 +517,34 @@ class AutoTrader {
         return;
       }
 
+      // MARKET REGIME VALIDATION: Check if market is tradeable
+      logger.info(`🔍 [Market Regime] ${symbol}: Checking market conditions...`);
+      const regimeData = this.marketRegimeDetector.classify(marketData);
+      
+      logger.info(`📊 [Market Regime] ${symbol}: ${regimeData.regime} (confidence: ${(regimeData.confidence * 100).toFixed(0)}%)`, {
+        volatility: regimeData.metrics?.volatility?.toFixed(2) + '%',
+        trendStrength: regimeData.metrics?.trendStrength?.toFixed(2) + '%',
+        adx: regimeData.metrics?.adx?.toFixed(2),
+        reasons: regimeData.reasons,
+      });
+
+      if (!this.marketRegimeDetector.isTradeable(regimeData)) {
+        logger.warn(`⛔ [Market Regime] ${symbol}: Market not tradeable - ${regimeData.regime} regime`);
+        return;
+      }
+      if (!marketData) {
+        logger.debug('No market data', { symbol });
+        return;
+      }
+
       logger.debug(`Market data for ${symbol}: fromCache=${marketData.fromCache}, price=${marketData.currentPrice.toFixed(6)}, klines=${marketData.klines.length}`);
 
       // Generate signal
       const signal = await this.signalAggregator.analyzeSymbol(symbol, marketData, openTrades);
 
       if (signal && signal.valid && signal.confidence >= 0.75) {
-        // Add news sentiment to signal
+        // Add regime, news, and higher timeframe info to signal
+        signal.marketRegime = regimeData;
         signal.newsSentiment = newsSafety.sentiment;
         signal.newsRiskLevel = newsSafety.riskLevel;
         
@@ -501,6 +585,10 @@ class AutoTrader {
 
             const currentPrice = parseFloat(ticker.c);
 
+            // SUCCESS: Reset failure counter for this symbol
+            this.priceFetchFailures.delete(symbol);
+            this.globalFailureCount = 0;
+
             return {
               symbol,
               klines,
@@ -531,6 +619,10 @@ class AutoTrader {
           // Fetch recent trades separately (not cached by scanner)
           const trades = await this.api.getRecentTrades(symbol, 100).catch(() => null);
 
+          // SUCCESS: Reset failure counter for this symbol
+          this.priceFetchFailures.delete(symbol);
+          this.globalFailureCount = 0;
+
           return {
             symbol,
             klines: cachedData.klines,
@@ -559,6 +651,10 @@ class AutoTrader {
 
         const currentPrice = parseFloat(ticker.price);
 
+        // SUCCESS: Reset failure counter for this symbol
+        this.priceFetchFailures.delete(symbol);
+        this.globalFailureCount = 0;
+
         return {
           symbol,
           klines,
@@ -575,6 +671,66 @@ class AutoTrader {
 
       } catch (error) {
         logger.error('Fetch market data error', { symbol, error: error.message });
+
+        // Track failures for monitoring
+        const currentFailures = (this.priceFetchFailures.get(symbol) || 0) + 1;
+        this.priceFetchFailures.set(symbol, currentFailures);
+        this.globalFailureCount++;
+        this.lastFailureTime = Date.now();
+
+        logger.warn('⚠️ [Price Fetch Failure]', {
+          symbol,
+          consecutiveFailures: currentFailures,
+          globalFailures: this.globalFailureCount,
+          maxConsecutiveFailures: this.maxConsecutiveFailures,
+          maxGlobalFailures: this.maxGlobalFailures,
+          error: error.message,
+        });
+
+        // CRITICAL: Treat price fetch failures as application crash
+        // Exit with code 1 to trigger PM2 auto-restart
+        if (currentFailures >= this.maxConsecutiveFailures) {
+          logger.error('🚨 [CRITICAL] Consecutive price fetch failures threshold reached! Treating as crash.', {
+            symbol,
+            failures: currentFailures,
+            threshold: this.maxConsecutiveFailures,
+            error: error.message,
+          });
+
+          // Send alert before exiting
+          await this.telegram.sendErrorAlert(
+            `Critical Price Fetch Failure for ${symbol}\n` +
+            `Consecutive failures: ${currentFailures}\n` +
+            `Error: ${error.message}\n` +
+            `Exiting with code 1 to trigger PM2 auto-restart.`
+          );
+
+          // Exit with code 1 (PM2 will auto-restart)
+          logger.error('💥 Forcing crash with exit code 1 to trigger PM2 auto-restart...');
+          process.exit(1);
+        }
+
+        // Check if global failure threshold reached
+        if (this.globalFailureCount >= this.maxGlobalFailures) {
+          logger.error('🚨 [CRITICAL] Global price fetch failures threshold reached! Treating as crash.', {
+            globalFailures: this.globalFailureCount,
+            threshold: this.maxGlobalFailures,
+            error: error.message,
+          });
+
+          // Send alert before exiting
+          await this.telegram.sendErrorAlert(
+            `Critical Global Price Fetch Failures\n` +
+            `Total failures: ${this.globalFailureCount}\n` +
+            `Error: ${error.message}\n` +
+            `Exiting with code 1 to trigger PM2 auto-restart.`
+          );
+
+          // Exit with code 1 (PM2 will auto-restart)
+          logger.error('💥 Forcing crash with exit code 1 to trigger PM2 auto-restart...');
+          process.exit(1);
+        }
+
         return null;
       }
     }
@@ -665,6 +821,38 @@ class AutoTrader {
         qtyPrecision: symbolInfo.qtyPrecision,
       });
 
+      // Calculate DYNAMIC LEVERAGE based on balance, signal, and market data
+      const dynamicLeverageResult = this.dynamicLeverageCalculator.calculateLeverage(
+        accountBalance,
+        signal,
+        marketData
+      );
+
+      // Validate leverage against symbol limits
+      const validatedLeverage = this.dynamicLeverageCalculator.validateLeverage(
+        dynamicLeverageResult.leverage,
+        symbolInfo
+      );
+
+      const leverage = validatedLeverage.leverage;
+
+      logger.info('🎯 [Dynamic Leverage] Optimal leverage calculated', {
+        symbol: signal.symbol,
+        accountBalance: accountBalance.toFixed(2),
+        leverage: leverage + 'x',
+        regime: signal.marketRegime?.regime,
+        atrPercent: signal.marketRegime?.metrics?.volatility?.toFixed(2) + '%',
+        adx: signal.marketRegime?.metrics?.adx?.toFixed(2),
+        confidence: (signal.confidence * 100).toFixed(1) + '%',
+        reason: validatedLeverage.reason || 'Within limits',
+      });
+
+      // Store leverage stats for debugging
+      const leverageStats = this.dynamicLeverageCalculator.getLeverageStats(
+        leverage,
+        dynamicLeverageResult.breakdown
+      );
+
       // Calculate position size using tier-specific risk
       const tickSize = symbolInfo.tickSize;
       const riskPercent = this.emergencyMode ? 0.5 : this.currentTier.riskPerTrade;
@@ -676,7 +864,7 @@ class AutoTrader {
         signal.entryPrice,
         signal.stopLoss,
         tickSize,
-        5, // leverage
+        leverage, // Use DYNAMIC leverage instead of fixed 5x
         24 // expected holding time in hours
       );
 
@@ -727,6 +915,7 @@ class AutoTrader {
         risk_percent: positionResult.riskPercent,
         status: 'PENDING',
         strategy: `Auto-Trading-${this.currentTier.name}`,
+        leverage: leverage, // Store DYNAMIC leverage
         notes: JSON.stringify({
           ...signal,
           tier: this.currentTier.name,
@@ -735,6 +924,25 @@ class AutoTrader {
           pricePrecision: symbolInfo.pricePrecision,
           qtyPrecision: symbolInfo.qtyPrecision,
           tickSize: tickSize,
+          leverage: leverage, // Store leverage in notes for reference
+          leverageStats: leverageStats, // Store leverage calculation breakdown
+          debugMetrics: {
+            marketRegime: signal.marketRegime?.regime || 'UNKNOWN',
+            regimeConfidence: signal.marketRegime?.confidence || 0,
+            volatility: signal.marketRegime?.metrics?.volatility || 0,
+            trendStrength: signal.marketRegime?.metrics?.trendStrength || 0,
+            adx: signal.marketRegime?.metrics?.adx || 0,
+            h4Trend: signal.higherTimeframeAlignment?.h4Trend || 'UNKNOWN',
+            h4Aligned: signal.higherTimeframeAlignment?.aligned || false,
+            signalAgreement: signal.agreement || 0,
+            signalConfidence: (signal.confidence * 100) || 0,
+            riskRewardRatio: signal.riskRewardRatio || 0,
+            strategiesCount: signal.signalsCount || 0,
+            strategies: signal.strategies || [],
+            newsSentiment: signal.newsSentiment,
+            newsRiskLevel: signal.newsRiskLevel,
+            leverage: leverage, // Store leverage in debug metrics
+          },
         }),
       });
 
@@ -779,15 +987,21 @@ class AutoTrader {
           riskAmount: positionResult.riskAmount.toFixed(2),
           riskPercent: riskPercent + '%',
           confidence: (signal.confidence * 100).toFixed(1) + '%',
+          leverage: leverage + 'x',
+          leverageType: 'DYNAMIC',
           paperTrading: this.paperTrading,
           emergencyMode: this.emergencyMode,
           orderIds: orderResult.orderIds,
           tickSize: tickSize,
           stepSize: symbolInfo.stepSize,
+          leverageReason: validatedLeverage.reason || 'Optimal leverage based on conditions',
         });
 
         this.tradeCount++;
         this.openTrades.set(tradeId, { ...trade, status: 'OPEN' });
+
+        // Activate cooldown for this symbol to prevent overtrading
+        this.setSymbolCooldown(signal.symbol);
 
       } catch (error) {
         logger.error('❌ [CRITICAL] Order execution failed, marking trade as FAILED', {
@@ -824,13 +1038,20 @@ class AutoTrader {
     const orderIds = [];
 
     try {
-      logger.info('📡 [Binance] Setting leverage', { symbol: trade.symbol, leverage: 3 });
-      await this.api.changeLeverage(trade.symbol, 3);
+      const tradeLeverage = trade.leverage || 3; // Use stored leverage or default to 3
+      
+      logger.info('📡 [Binance] Setting leverage', { 
+        symbol: trade.symbol, 
+        leverage: tradeLeverage + 'x',
+        type: 'DYNAMIC' 
+      });
+      await this.api.changeLeverage(trade.symbol, tradeLeverage);
 
       logger.info('📡 [Binance] Placing market order', {
         symbol: trade.symbol,
         side: trade.side,
         quantity: trade.quantity,
+        leverage: tradeLeverage + 'x',
       });
 
       const orderSide = trade.side === 'LONG' ? 'BUY' : 'SELL';
@@ -959,10 +1180,14 @@ class AutoTrader {
       const { v4: uuidv4 } = require('uuid');
       const orderIds = [];
 
+      const tradeLeverage = trade.leverage || 3; // Use stored leverage or default to 3
+
       logger.info('📝 [Paper] Simulating market order', {
         symbol: trade.symbol,
         side: trade.side,
         quantity: trade.quantity,
+        leverage: tradeLeverage + 'x',
+        type: 'DYNAMIC',
       });
 
       const marketOrderId = uuidv4();
@@ -988,6 +1213,7 @@ class AutoTrader {
       logger.info('✅ [Paper] Simulating stop loss order', {
         symbol: trade.symbol,
         stopLoss: trade.stop_loss,
+        leverage: tradeLeverage + 'x',
       });
 
       const slOrderId = uuidv4();
@@ -1011,6 +1237,7 @@ class AutoTrader {
       logger.info('✅ [Paper] Simulating take profit order', {
         symbol: trade.symbol,
         takeProfit: trade.take_profit,
+        leverage: tradeLeverage + 'x',
       });
 
       const tpOrderId = uuidv4();
@@ -1522,6 +1749,29 @@ class AutoTrader {
   }
 
   /**
+   * Get failure statistics
+   */
+  getFailureStats() {
+    const symbolFailures = Array.from(this.priceFetchFailures.entries()).map(([symbol, count]) => ({
+      symbol,
+      count,
+    }));
+
+    return {
+      globalFailures: this.globalFailureCount,
+      maxGlobalFailures: this.maxGlobalFailures,
+      maxConsecutiveFailures: this.maxConsecutiveFailures,
+      failureCooldown: this.failureCooldown,
+      lastFailureTime: this.lastFailureTime,
+      symbolFailures,
+      symbolFailuresCount: this.priceFetchFailures.size,
+      needsRestart: 
+        this.globalFailureCount >= this.maxGlobalFailures ||
+        Array.from(this.priceFetchFailures.values()).some(count => count >= this.maxConsecutiveFailures),
+    };
+  }
+
+  /**
    * Get statistics with survival metrics
    */
   getStats() {
@@ -1541,7 +1791,10 @@ class AutoTrader {
       lastScanTime: this.lastScanTime,
       paperTrading: this.paperTrading,
       tradingEnabled: this.tradingEnabled,
-      
+
+      // Failure stats
+      failures: this.getFailureStats(),
+
       // Survival metrics
       survival: {
         tier: this.currentTier.name,
@@ -1557,7 +1810,7 @@ class AutoTrader {
         emergencyMode: this.emergencyMode,
         serverCost: SURVIVAL_CONFIG.serverCostMonthly,
       },
-      
+
       // Tier config
       tierConfig: {
         riskPerTrade: this.currentTier.riskPerTrade + '%',
