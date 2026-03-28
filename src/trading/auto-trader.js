@@ -76,6 +76,18 @@ class AutoTrader {
       redisClient: config.redisClient,
     });
 
+    // Initialize signal aggregator
+    this.signalAggregator = new SignalAggregator({
+      minConfidence: config.minConfidence || 0.75,
+      minConfluence: config.minConfluence || 2.5,
+      maxPositions: config.maxPositions || 2,
+      requiredAgreement: config.requiredAgreement || 0.80,
+      useHigherTimeframe: config.useHigherTimeframe !== false,
+      binanceAPI: config.api,
+      useMultiConfirmation: config.useMultiConfirmation !== false,
+      redisClient: config.redisClient,
+    });
+
     // Critical failure tracking for PM2 restart
     this.priceFetchFailures = new Map(); // symbol -> consecutive failure count
     this.maxConsecutiveFailures = config.maxConsecutiveFailures || 10; // Max failures before exit (increased from 5)

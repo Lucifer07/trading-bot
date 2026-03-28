@@ -1,31 +1,52 @@
 require('dotenv').config();
+console.log('Loading logger...');
 const logger = require('./utils/logger');
+console.log('Logger loaded');
 const { config, validateConfig } = require('./config');
+console.log('Config loaded');
 const BinanceFuturesAPI = require('./api/binance');
+console.log('Binance API loaded');
 const BinanceWebSocketClient = require('./api/binance-ws');
+console.log('Binance WS loaded');
 const WebSocketScanner = require('./api/ws-scanner');
+console.log('WS Scanner loaded');
 const RiskCalculator = require('./risk/calculator');
+console.log('Risk Calculator loaded');
 const { getDatabase } = require('./storage/db');
+console.log('DB loaded');
 const { getRedis } = require('./storage/redis');
+console.log('Redis loaded');
 const TelegramAlerts = require('./alerts/telegram');
+console.log('Telegram loaded');
 const AutoTrader = require('./trading/auto-trader');
+console.log('AutoTrader loaded');
 const SymbolScanner = require('./utils/symbol-scanner');
+console.log('Symbol Scanner loaded');
 
 class TradingBot {
   constructor() {
+    console.log('TradingBot constructor: 1');
     this.config = config;
     this.isRunning = false;
     this.paperTrading = config.trading.paperTrading;
     this.tradingEnabled = config.trading.enabled;
 
+    console.log('TradingBot constructor: 2');
     // Initialize components
     this.api = new BinanceFuturesAPI();
+    console.log('TradingBot constructor: 3');
     this.ws = new BinanceWebSocketClient();
+    console.log('TradingBot constructor: 4');
     this.wsScanner = new WebSocketScanner(); // WebSocket scanner for all symbols
+    console.log('TradingBot constructor: 5');
     this.riskCalculator = new RiskCalculator();
+    console.log('TradingBot constructor: 6');
     this.db = getDatabase();
+    console.log('TradingBot constructor: 7');
     this.redis = getRedis();
+    console.log('TradingBot constructor: 8');
     this.telegram = new TelegramAlerts();
+    console.log('TradingBot constructor: 9');
 
     // State
     this.accountBalance = 0;
@@ -37,10 +58,13 @@ class TradingBot {
     this.tickerCache = new Map(); // symbol -> ticker data
     this.bookTickerCache = new Map(); // symbol -> best bid/ask
 
+    console.log('TradingBot constructor: 10');
     // Symbol Scanner (with WebSocket scanner)
     this.symbolScanner = new SymbolScanner(this.redis, this.telegram, this.wsScanner);
+    console.log('TradingBot constructor: 11');
 
     // Auto-trading
+    console.log('TradingBot constructor: 12 - Creating AutoTrader');
     this.autoTrader = new AutoTrader({
       api: this.api,
       riskCalculator: this.riskCalculator,
@@ -55,6 +79,7 @@ class TradingBot {
       positionCache: this.openPositions, // Pass position cache from websocket
       bot: this, // Pass TradingBot instance for accessing cached data
     });
+    console.log('TradingBot constructor: 13 - AutoTrader created');
   }
 
   async start() {
@@ -788,7 +813,9 @@ class TradingBot {
 
 // Main execution
 async function main() {
+  console.log('main: Starting');
   const bot = new TradingBot();
+  console.log('main: Bot created');
 
   // Handle graceful shutdown
   process.on('SIGINT', async () => {
@@ -804,7 +831,9 @@ async function main() {
   });
 
   // Start the bot
+  console.log('main: Calling bot.start()');
   const started = await bot.start();
+  console.log('main: bot.start() returned:', started);
 
   if (!started) {
     logger.error('Failed to start bot');
@@ -812,16 +841,12 @@ async function main() {
   }
 
   // Keep the process running
+  console.log('main: About to keep process running');
   logger.info('Bot is running. Press Ctrl+C to stop.');
 
-  // Keep the process alive by creating a never-resolving promise
-  await new Promise((resolve) => {
-    // This promise never resolves, keeping the process alive indefinitely
-    // The process will only exit when:
-    // 1. SIGINT (Ctrl+C) is received
-    // 2. SIGTERM is received
-    // 3. An unhandled error occurs
-  });
+  // Keep the process alive - this promise never resolves
+  console.log('main: Waiting forever...');
+  return new Promise(() => {});
 }
 
 // Export for use in other modules
