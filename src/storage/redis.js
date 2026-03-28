@@ -3,38 +3,143 @@ const logger = require('../utils/logger');
 const { config } = require('../config');
 
 class RedisClient {
-  constructor() {
-    this.client = new Redis({
-      host: config.redis.host,
-      port: config.redis.port,
-      password: config.redis.password || undefined,
-      retryStrategy: (times) => {
-        const delay = Math.min(times * 50, 2000);
-        return delay;
-      },
-      maxRetriesPerRequest: 3,
-    });
+  constructor(config = {}) {
+    this.config = config;
+    this.client = null;
+    this.isConnected = false;
+    this.isOptional = config.isOptional || false; // Redis optional for trading
+    this.maxRetries = config.maxRetries || 10; // Increased from 3 to 10
+    this.retryDelay = config.retryDelay || 3000;
+    this.retries = 0;
+    this.lastError = null;
+    this.connectTimeout = config.connectTimeout || 10000; // 10 seconds connect timeout
+  }
 
-    this.client.on('connect', () => {
-      logger.info('Redis connected');
-    });
+  async getClient() {
+    // If already connected and healthy, return existing client
+    if (this.client && this.isConnected) {
+      return this.client;
+    }
 
-    this.client.on('error', (err) => {
-      logger.error('Redis error', { error: err.message });
-    });
+    try {
+      const redisConfigData = this.config.redis || config.redis;
 
-    this.client.on('close', () => {
-      logger.warn('Redis connection closed');
-    });
+      logger.info('Attempting Redis connection', {
+        host: redisConfigData.host,
+        port: redisConfigData.port,
+        isOptional: this.isOptional,
+        timeout: this.connectTimeout,
+        maxRetries: this.maxRetries,
+      });
+
+      const redisConfig = {
+        socket: {
+          host: redisConfigData.host,
+          port: redisConfigData.port,
+          connectTimeout: this.connectTimeout,
+          reconnectStrategy: 'exponential',
+          retryStrategy: 'reconnect',
+          retryMaxRetries: this.maxRetries,
+          retryMaxDelay: this.retryDelay,
+        },
+        password: redisConfigData.password || undefined,
+      };
+
+      this.client = Redis.createClient(redisConfig);
+
+      this.client.on('connect', () => {
+        logger.info('✅ Redis connected');
+        this.isConnected = true;
+        this.retries = 0;
+        this.lastError = null;
+      });
+
+      this.client.on('ready', () => {
+        logger.info('✅ Redis ready for operations');
+        this.isConnected = true;
+      });
+
+      this.client.on('error', (err) => {
+        const redisConfigData = this.config.redis || config.redis;
+        logger.error('❌ Redis client error', {
+          error: err.message,
+          code: err.code,
+          stack: err.stack,
+          host: redisConfigData.host,
+          port: redisConfigData.port,
+        });
+        this.lastError = err;
+        this.isConnected = false;
+      });
+
+      this.client.on('close', () => {
+        logger.warn('⚠️  Redis connection closed');
+        this.isConnected = false;
+      });
+
+      this.client.on('end', () => {
+        logger.warn('🔚  Redis connection ended');
+        this.isConnected = false;
+      });
+
+      this.client.on('reconnecting', () => {
+        logger.warn('🔄 Redis reconnecting...');
+        this.isConnected = false;
+      });
+
+      this.client.on('warning', (msg) => {
+        logger.warn('⚠️ Redis warning', { msg });
+      });
+
+      return this.client;
+    } catch (error) {
+      const redisConfigData = this.config.redis || config.redis;
+      logger.error('❌ Failed to create Redis client', {
+        error: error.message,
+        stack: error.stack,
+        host: redisConfigData.host,
+        port: redisConfigData.port,
+        isOptional: this.isOptional,
+      });
+
+      this.client = null;
+      this.isConnected = false;
+
+      // If Redis is optional, don't crash - just log error
+      if (this.isOptional) {
+        logger.warn('⚠️ Redis is optional, bot will continue without caching');
+      } else {
+        throw error;
+      }
+    }
   }
 
   async testConnection() {
     try {
+      // Ensure client is created
+      if (!this.client) {
+        await this.getClient();
+      }
       const result = await this.client.ping();
-      logger.info('Redis connection test', { result });
+      const redisConfigData = this.config.redis || config.redis;
+      logger.info('✅ Redis connection test successful', { result, host: redisConfigData.host, port: redisConfigData.port });
       return result === 'PONG';
     } catch (error) {
-      logger.error('Redis connection test failed', { error: error.message });
+      const redisConfigData = this.config.redis || config.redis;
+      logger.error('❌ Redis connection test failed', {
+        error: error.message,
+        code: error.code,
+        stack: error.stack,
+        host: redisConfigData.host,
+        port: redisConfigData.port,
+        isOptional: this.isOptional
+      });
+
+      if (this.isOptional) {
+        logger.warn('⚠️ Redis is optional - bot will continue without caching features');
+        return false;
+      }
+
       throw error;
     }
   }

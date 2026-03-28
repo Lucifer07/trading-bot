@@ -813,6 +813,15 @@ async function main() {
 
   // Keep the process running
   logger.info('Bot is running. Press Ctrl+C to stop.');
+
+  // Keep the process alive by creating a never-resolving promise
+  await new Promise((resolve) => {
+    // This promise never resolves, keeping the process alive indefinitely
+    // The process will only exit when:
+    // 1. SIGINT (Ctrl+C) is received
+    // 2. SIGTERM is received
+    // 3. An unhandled error occurs
+  });
 }
 
 // Export for use in other modules

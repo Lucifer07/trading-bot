@@ -21,7 +21,7 @@ const {
 class AutoTrader {
   constructor(config = {}) {
     this.config = config;
-    this.db = getDatabase();
+    this.db = config.db;
     this.api = config.api;
     this.riskCalculator = config.riskCalculator;
     this.paperTrading = config.paperTrading || false;
@@ -51,15 +51,39 @@ class AutoTrader {
     this.signalCooldownMap = new Map();
     this.cooldownPeriod = config.cooldownPeriod || 4 * 60 * 60 * 1000; // 4 hours default cooldown
 
+    // Initialize market regime detector
+    this.marketRegimeDetector = new MarketRegimeDetector({
+      minATR: config.minATR || 0.8, // 0.8% minimum volatility
+      minSlope: config.minSlope || 0.5, // 0.5% minimum trend slope
+      strongTrendSlope: config.strongTrendSlope || 2.0, // 2.0% for strong trend
+    });
+
+    // Initialize dynamic leverage calculator
+    this.dynamicLeverageCalculator = new DynamicLeverageCalculator({
+      maxLeverage: config.maxLeverage || 20,
+      minLeverage: config.minLeverage || 1,
+      defaultLeverage: config.defaultLeverage || 3,
+      balanceTiers: config.balanceTiers,
+      regimeMultipliers: config.regimeMultipliers,
+      volatilityRanges: config.volatilityRanges,
+      adxRanges: config.adxRanges,
+      confidenceRanges: config.confidenceRanges,
+    });
+
+    // Initialize news checker
+    this.newsChecker = new NewsChecker({
+      enabled: process.env.NEWS_CHECK_ENABLED !== 'false',
+      redisClient: config.redisClient,
+    });
+
     // Critical failure tracking for PM2 restart
     this.priceFetchFailures = new Map(); // symbol -> consecutive failure count
-    this.maxConsecutiveFailures = config.maxConsecutiveFailures || 5; // Max failures before exit
+    this.maxConsecutiveFailures = config.maxConsecutiveFailures || 10; // Max failures before exit (increased from 5)
     this.globalFailureCount = 0;
-    this.maxGlobalFailures = config.maxGlobalFailures || 10; // Max total failures before exit
+    this.maxGlobalFailures = config.maxGlobalFailures || 20; // Max total failures before exit (increased from 10)
     this.lastFailureTime = null;
-    this.failureCooldown = config.failureCooldown || 5 * 60 * 1000; // 5 minutes cooldown for failure tracking
+    this.failureCooldown = config.failureCooldown || 10 * 60 * 1000; // 10 minutes cooldown for failure tracking (increased from 5)
 
-    // State
     // State
     this.isRunning = false;
     this.scanInterval = this.currentTier.scanInterval;
@@ -279,7 +303,9 @@ class AutoTrader {
     await this.loadOpenTrades();
 
     // Start the main loop
-    this.mainLoop();
+    this.mainLoop().catch(err => {
+      console.error('AutoTrader.mainLoop error:', err.message);
+    });
 
     return true;
   }
@@ -357,20 +383,20 @@ class AutoTrader {
             logger.error('Failed to subscribe to symbols', { error: err.message });
           });
         }
-        
+
         // 4. Analyze symbols
         logger.info('🔍 Step 3: Analyzing symbols...');
         await this.scan();
         await this.manageOpenTrades();
-        
+
         logger.info('✅ Cycle complete\n');
-        
+
       } catch (error) {
         logger.error('Main loop error', { error: error.message, stack: error.stack });
         await this.sleep(10000); // Wait 10s on error
       }
     }
-    
+
     logger.info('Main loop stopped');
   }
 
@@ -405,9 +431,74 @@ class AutoTrader {
           await this.scanSymbol(symbol, openTrades);
           // Small delay between symbols to avoid rate limits (200ms)
           await this.sleep(200);
-        } catch (error) {
-          logger.error('Symbol scan error', { symbol, error: error.message });
+      } catch (error) {
+        logger.error('Fetch market data error', { symbol, error: error.message });
+
+        // TEMPORARILY DISABLED: Don't force exit for now to see what's happening
+        // Track failures for monitoring only
+        const currentFailures = (this.priceFetchFailures.get(symbol) || 0) + 1;
+        this.priceFetchFailures.set(symbol, currentFailures);
+        this.globalFailureCount++;
+        this.lastFailureTime = Date.now();
+
+        logger.warn('⚠️ [Price Fetch Failure]', {
+          symbol,
+          consecutiveFailures: currentFailures,
+          globalFailures: this.globalFailureCount,
+          maxConsecutiveFailures: this.maxConsecutiveFailures,
+          maxGlobalFailures: this.maxGlobalFailures,
+          error: error.message,
+        });
+
+        // DISABLED: Don't force exit - let's see what happens
+        /*
+        // CRITICAL: Treat price fetch failures as application crash
+        // Exit with code 1 to trigger PM2 auto-restart
+        if (currentFailures >= this.maxConsecutiveFailures) {
+          logger.error('🚨 [CRITICAL] Consecutive price fetch failures threshold reached! Treating as crash.', {
+            symbol,
+            failures: currentFailures,
+            threshold: this.maxConsecutiveFailures,
+            error: error.message,
+          });
+
+          // Send alert before exiting
+          await this.telegram.sendErrorAlert(
+            `Critical Price Fetch Failure for ${symbol}\n` +
+            `Consecutive failures: ${currentFailures}\n` +
+            `Error: ${error.message}\n` +
+            `Exiting with code 1 to trigger PM2 auto-restart.`
+          );
+
+          // Exit with code 1 (PM2 will auto-restart)
+          logger.error('💥 Forcing crash with exit code 1 to trigger PM2 auto-restart...');
+          process.exit(1);
         }
+
+        // Check if global failure threshold reached
+        if (this.globalFailureCount >= this.maxGlobalFailures) {
+          logger.error('🚨 [CRITICAL] Global price fetch failures threshold reached! Treating as crash.', {
+            globalFailures: this.globalFailureCount,
+            threshold: this.maxGlobalFailures,
+            error: error.message,
+          });
+
+          // Send alert before exiting
+          await this.telegram.sendErrorAlert(
+            `Critical Global Price Fetch Failures\n` +
+            `Total failures: ${this.globalFailureCount}\n` +
+            `Error: ${error.message}\n` +
+            `Exiting with code 1 to trigger PM2 auto-restart.`
+          );
+
+          // Exit with code 1 (PM2 will auto-restart)
+          logger.error('💥 Forcing crash with exit code 1 to trigger PM2 auto-restart...');
+          process.exit(1);
+        }
+        */
+
+        return null;
+      }
       }
 
       logger.info('✅ Scan complete', {
